@@ -33,6 +33,9 @@ bool is_valid(const SimulationConfiguration& configuration) {
            camera.vertical_fov_degrees > 0.0 && camera.vertical_fov_degrees < 180.0 &&
            disk.inner_radius_in_schwarzschild_radii >= 3.0 &&
            disk.outer_radius_in_schwarzschild_radii > disk.inner_radius_in_schwarzschild_radii &&
+           std::isfinite(disk.half_thickness_in_schwarzschild_radii) &&
+           disk.half_thickness_in_schwarzschild_radii >= 0.02 &&
+           disk.half_thickness_in_schwarzschild_radii <= 0.75 &&
            std::abs(disk.rotation_sign) == 1.0 && integration.absolute_tolerance > 0.0 &&
            integration.relative_tolerance > 0.0 && integration.minimum_step > 0.0 &&
            integration.maximum_step >= integration.minimum_step && integration.maximum_steps > 0 &&

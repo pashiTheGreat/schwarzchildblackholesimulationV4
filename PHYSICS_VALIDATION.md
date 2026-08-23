@@ -74,6 +74,23 @@ F(r) = 3 G M dotM / (8 pi r³) (1 - sqrt(r_in/r))
 T_eff = (F/sigma)^(1/4)
 ```
 
+With shader radii expressed in Schwarzschild units, C++ uploads
+
+```text
+T_scale = (3 G M dotM / (8 pi sigma r_s^3))^(1/4),
+```
+
+and the production shader evaluates
+
+```text
+physicalFluxShape = (1 - sqrt(r_in/r)) / r^3
+T_local = T_scale * physicalFluxShape^(1/4).
+```
+
+The separate display profile uses `(r/r_in)^-3` to retain the established
+exposure shape. It does not feed the local Kelvin calculation; doing so would
+introduce an extra `r_in^3` flux factor and an `r_in^(3/4)` temperature factor.
+
 The shader maps effective temperature through an approximate blackbody RGB
 conversion. It evaluates the frequency shift from four-vectors for a static
 observer and circular Schwarzschild emitter,
@@ -86,6 +103,14 @@ then applies `g^4`, so the rendered quantity is explicitly a bolometric
 intensity approximation. Procedural density variation modulates emissivity but
 never ray motion. Physical mode has no fixed orange palette, artificial photon
 sphere emission, or undocumented radiance boost.
+
+Disk intersection uses a finite slab whose configured value is explicitly its
+half-thickness. The default is `0.12 r_s`; `T`/`Shift+T` adjust it over
+`0.02-0.75 r_s`. Because GPU positions are already dimensionless with
+`r_s = 1`, C++ uploads the value directly and the shader tests the signed
+distance from the inclined midplane against that half-thickness. A `1e-4`
+positive epsilon is used only as a numerical safeguard, not as a physical
+minimum.
 
 This disk is not a faithful model of quiescent Sagittarius A*. That source is
 usually described by a hot, optically thin, radiatively inefficient plasma;
@@ -114,7 +139,33 @@ The deterministic 64×48 GPU export is checked by
 verified RTX 3050 Ti run it reported 3,072 rays, two classification differences
 at the discretized shadow boundary (allowance eight), zero unresolved/invalid,
 maximum initial null residual `6.01e-7`, zero energy span, and maximum escaped
-final null residual `5.14e-6`.
+final null residual `2.97641e-6`.
+
+The production-shader temperature probe is checked against
+`physics/accretion_disk.cpp` at `3.5`, `4.5`, `6`, `9`, and `12 r_s`. The
+executed default/tenfold-accretion GPU results were:
+
+| Radius | GPU default | CPU default | GPU at `10 dotM` |
+| ---: | ---: | ---: | ---: |
+| `3.5 r_s` | `5647.60986 K` | `5647.61006 K` | `10043.0283 K` |
+| `4.5 r_s` | `5866.05127 K` | `5866.05094 K` | `10431.4775 K` |
+| `6 r_s` | `5313.83496 K` | `5313.83502 K` | `9449.48242 K` |
+| `9 r_s` | `4296.92188 K` | `4296.92172 K` | `7641.12744 K` |
+| `12 r_s` | `3611.60938 K` | `3611.60912 K` | `6422.45020 K` |
+
+The float acceptance is `2e-5` relative or `0.05 K` absolute, whichever is
+larger; the measured maximum relative temperature error was `7.0626114e-8`.
+The GPU ratio at `4.5 r_s` was `1.77827929`, compared with
+`10^(1/4) = 1.77827941004`. Reversing disk rotation swapped the two Doppler
+frequency shifts (`1.10368633` and `0.778389275`) while the maximum change in
+local emitted temperature was `0 K`.
+
+The deterministic disk-thickness export uses the same camera and a 160x120
+status map at `0.02 r_s` and `0.75 r_s`. The verified run changed 4,952 of
+19,200 classifications and increased disk hits from 5,726 to 10,678, with zero
+unresolved/invalid rays. The comparator requires at least five percent of the
+map (960 pixels) to change. The former `max(thickness, 1.0)` implementation
+would classify both exports with the same slab and fail with zero changes.
 
 `VALIDATION_REPORT.md` records the final clean-build commands, hardware,
 screenshots, timing, and any blocked checks.

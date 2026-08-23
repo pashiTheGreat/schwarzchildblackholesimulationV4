@@ -1,5 +1,6 @@
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
+#include <algorithm>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -20,6 +21,7 @@
 #include <string>
 
 #include "app/camera.hpp"
+#include "physics/accretion_disk.hpp"
 #include "physics/schwarzschild.hpp"
 #include "physics/simulation_config.hpp"
 #include "rendering/shader_loader.hpp"
@@ -41,10 +43,24 @@ using namespace std;
 struct RunOptions {
     bool gpu_validation = false;
     bool interaction_smoke = false;
+    bool thickness_validation = false;
+    bool temperature_validation = false;
     bool performance_smoke = false;
     bool legacy_allocation_benchmark = false;
     string capture_output_path;
     int capture_frames_remaining = 0;
+};
+
+constexpr size_t temperatureValidationSampleCount = 5;
+
+struct GpuTemperatureSample {
+    float radius = 0.0f;
+    float localTemperature = 0.0f;
+    float physicalFluxShape = 0.0f;
+    float displayFluxProfile = 0.0f;
+    float positiveAngularMomentumShift = 0.0f;
+    float negativeAngularMomentumShift = 0.0f;
+    float rotationSign = 0.0f;
 };
 
 using Camera = blackhole::app::Camera;
@@ -297,18 +313,24 @@ struct Engine {
         const bool useReducedMotionResolution = simulationConfig.resolution.dynamic_resolution &&
                                                 cam.moving &&
                                                 !simulationConfig.resolution.full_resolution;
-        int cw = runOptions.gpu_validation
-                     ? 64
-                     : (simulationConfig.resolution.full_resolution
-                            ? WIDTH
-                            : (useReducedMotionResolution ? std::max(80, COMPUTE_WIDTH / 2)
-                                                          : COMPUTE_WIDTH));
-        int ch = runOptions.gpu_validation
-                     ? 48
-                     : (simulationConfig.resolution.full_resolution
-                            ? HEIGHT
-                            : (useReducedMotionResolution ? std::max(60, COMPUTE_HEIGHT / 2)
-                                                          : COMPUTE_HEIGHT));
+        int cw =
+            simulationConfig.resolution.full_resolution
+                ? WIDTH
+                : (useReducedMotionResolution ? std::max(80, COMPUTE_WIDTH / 2) : COMPUTE_WIDTH);
+        int ch =
+            simulationConfig.resolution.full_resolution
+                ? HEIGHT
+                : (useReducedMotionResolution ? std::max(60, COMPUTE_HEIGHT / 2) : COMPUTE_HEIGHT);
+        if (runOptions.gpu_validation) {
+            cw = 64;
+            ch = 48;
+        } else if (runOptions.temperature_validation) {
+            cw = static_cast<int>(temperatureValidationSampleCount);
+            ch = 1;
+        } else if (runOptions.thickness_validation) {
+            cw = 160;
+            ch = 120;
+        }
         lastComputeWidth = cw;
         lastComputeHeight = ch;
 
@@ -330,7 +352,9 @@ struct Engine {
         glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(zeroStatusCounts),
                         zeroStatusCounts.data());
 
-        if (runOptions.gpu_validation || runOptions.legacy_allocation_benchmark) {
+        if (runOptions.gpu_validation || runOptions.thickness_validation ||
+            runOptions.temperature_validation || runOptions.interaction_smoke ||
+            runOptions.legacy_allocation_benchmark) {
             const GLsizeiptr pixelCount = static_cast<GLsizeiptr>(cw) * ch;
             if (runOptions.legacy_allocation_benchmark || pixelCount > validationPixelCapacity) {
                 glBindBuffer(GL_SHADER_STORAGE_BUFFER, statusPixelsSSBO);
@@ -406,14 +430,16 @@ struct Engine {
             runOptions.gpu_validation
                 ? 0.0f
                 : static_cast<float>(simulationConfig.disk.outer_radius_in_schwarzschild_radii);
-        float thickness = diskThicknessInRadii;
-        constexpr double stefanBoltzmann = 5.670374419e-8;
+        // Dimensionless GPU coordinates use r_s = 1, so the configured value
+        // is uploaded directly as a half-thickness in Schwarzschild radii.
+        float thickness = glm::clamp(diskThicknessInRadii, 1.0e-4f, 0.75f);
         const double mass = simulationConfig.black_hole.mass_kg;
         const double radius = simulationConfig.black_hole.schwarzschild_radius_m;
         const double fluxScale = 3.0 * blackhole::physics::gravitational_constant_si * mass *
                                  simulationConfig.disk.accretion_rate_kg_per_s /
                                  (8.0 * M_PI * radius * radius * radius);
-        const float temperatureScale = static_cast<float>(pow(fluxScale / stefanBoltzmann, 0.25));
+        const float temperatureScale =
+            static_cast<float>(pow(fluxScale / blackhole::physics::stefan_boltzmann_si, 0.25));
         struct DiskData {
             float innerRadius;
             float outerRadius;
@@ -459,7 +485,7 @@ struct Engine {
             int validationOverlay;
             int backgroundMode;
             int exportDiagnostics;
-            int pad2;
+            int temperatureValidation;
         } data{};
         data.minimumStep = static_cast<float>(simulationConfig.integration.minimum_step);
         // The legacy benchmark retains the previous 0.05 bound. Both paths
@@ -479,7 +505,12 @@ struct Engine {
         data.validationOverlay = simulationConfig.validation_overlay ? 1 : 0;
         data.backgroundMode = simulationConfig.background_mode;
         data.exportDiagnostics =
-            (runOptions.gpu_validation || runOptions.legacy_allocation_benchmark) ? 1 : 0;
+            (runOptions.gpu_validation || runOptions.thickness_validation ||
+             runOptions.temperature_validation || runOptions.interaction_smoke ||
+             runOptions.legacy_allocation_benchmark)
+                ? 1
+                : 0;
+        data.temperatureValidation = runOptions.temperature_validation ? 1 : 0;
 
         glBindBuffer(GL_UNIFORM_BUFFER, integrationUBO);
         glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(data), &data);
@@ -520,10 +551,11 @@ struct Engine {
                     cam.radius /
                         static_cast<float>(simulationConfig.black_hole.schwarzschild_radius_m),
                     simulationConfig.camera.vertical_fov_degrees);
-        ImGui::Text("Disk: %.2f-%.2f r_s | inclination %.1f deg",
+        ImGui::Text("Disk: %.2f-%.2f r_s | half-thickness %.3f r_s",
                     simulationConfig.disk.inner_radius_in_schwarzschild_radii,
                     simulationConfig.disk.outer_radius_in_schwarzschild_radii,
-                    degrees(diskInclinationRadians));
+                    diskThicknessInRadii);
+        ImGui::Text("Disk inclination: %.1f deg", degrees(diskInclinationRadians));
         ImGui::Text("Tolerance: abs %.1e / rel %.1e",
                     simulationConfig.integration.absolute_tolerance,
                     simulationConfig.integration.relative_tolerance);
@@ -643,6 +675,68 @@ struct Engine {
             }
         }
         return true;
+    }
+    vector<GpuTemperatureSample> readGpuTemperatureSamples() {
+        const size_t pixelCount =
+            static_cast<size_t>(lastComputeWidth) * static_cast<size_t>(lastComputeHeight);
+        vector<float> invariants(pixelCount * 8);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, invariantPixelsSSBO);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                           static_cast<GLsizeiptr>(invariants.size() * sizeof(float)),
+                           invariants.data());
+
+        vector<GpuTemperatureSample> samples(pixelCount);
+        for (size_t index = 0; index < pixelCount; ++index) {
+            samples[index] = {invariants[index * 8],     invariants[index * 8 + 1],
+                              invariants[index * 8 + 2], invariants[index * 8 + 3],
+                              invariants[index * 8 + 4], invariants[index * 8 + 5],
+                              invariants[index * 8 + 6]};
+        }
+        return samples;
+    }
+    bool exportGpuTemperatureValidation(const string& outputPath,
+                                        const vector<GpuTemperatureSample>& defaultSamples,
+                                        const vector<GpuTemperatureSample>& tenfoldSamples,
+                                        const vector<GpuTemperatureSample>& reversedSamples) {
+        if (defaultSamples.size() != temperatureValidationSampleCount ||
+            tenfoldSamples.size() != defaultSamples.size() ||
+            reversedSamples.size() != defaultSamples.size()) {
+            return false;
+        }
+
+        ofstream output(outputPath, ios::trunc);
+        if (!output)
+            return false;
+        output << "radius_r_s,temperature_default_k,temperature_10x_k,"
+                  "temperature_reversed_k,shift_l_positive,shift_l_negative,"
+                  "reversed_shift_l_positive,reversed_shift_l_negative,"
+                  "physical_flux_shape,display_flux_profile\n";
+        output << setprecision(9);
+        for (size_t index = 0; index < defaultSamples.size(); ++index) {
+            const auto& baseline = defaultSamples[index];
+            const auto& tenfold = tenfoldSamples[index];
+            const auto& reversed = reversedSamples[index];
+            output << baseline.radius << ',' << baseline.localTemperature << ','
+                   << tenfold.localTemperature << ',' << reversed.localTemperature << ','
+                   << baseline.positiveAngularMomentumShift << ','
+                   << baseline.negativeAngularMomentumShift << ','
+                   << reversed.positiveAngularMomentumShift << ','
+                   << reversed.negativeAngularMomentumShift << ',' << baseline.physicalFluxShape
+                   << ',' << baseline.displayFluxProfile << '\n';
+        }
+        return output.good();
+    }
+    vector<GLuint> readGpuStatuses() {
+        const size_t pixelCount =
+            static_cast<size_t>(lastComputeWidth) * static_cast<size_t>(lastComputeHeight);
+        vector<GLuint> statuses(pixelCount);
+        if (pixelCount == 0)
+            return statuses;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, statusPixelsSSBO);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                           static_cast<GLsizeiptr>(statuses.size() * sizeof(GLuint)),
+                           statuses.data());
+        return statuses;
     }
     bool captureFramebufferBmp(const string& outputPath) {
         if (WIDTH <= 0 || HEIGHT <= 0)
@@ -769,6 +863,8 @@ int main(int argc, char** argv) {
     RunOptions runOptions;
     bool& gpuValidationMode = runOptions.gpu_validation;
     bool& interactionSmokeMode = runOptions.interaction_smoke;
+    bool& thicknessValidationMode = runOptions.thickness_validation;
+    bool& temperatureValidationMode = runOptions.temperature_validation;
     bool& performanceSmokeMode = runOptions.performance_smoke;
     bool& legacyAllocationBenchmark = runOptions.legacy_allocation_benchmark;
     string& captureOutputPath = runOptions.capture_output_path;
@@ -804,6 +900,10 @@ int main(int argc, char** argv) {
             captureFramesRemaining = 2;
         } else if (string(argv[index]) == "--interaction-smoke") {
             interactionSmokeMode = true;
+        } else if (string(argv[index]) == "--thickness-validation-export") {
+            thicknessValidationMode = true;
+        } else if (string(argv[index]) == "--temperature-validation-export") {
+            temperatureValidationMode = true;
         } else if (string(argv[index]) == "--performance-smoke") {
             performanceSmokeMode = true;
         } else if (string(argv[index]) == "--legacy-allocations") {
@@ -816,6 +916,120 @@ int main(int argc, char** argv) {
     Engine engine(simulationConfig, diskInclinationRadians, diskThicknessInRadii, runOptions);
     CallbackState callbackState{&camera, &engine};
     setupCameraCallbacks(engine.window, callbackState);
+    if (temperatureValidationMode) {
+        simulationConfig.render_mode = blackhole::physics::RenderMode::Physical;
+        simulationConfig.disk.visible = true;
+        simulationConfig.resolution.dynamic_resolution = false;
+        const double defaultAccretionRate = simulationConfig.disk.accretion_rate_kg_per_s;
+
+        simulationConfig.disk.rotation_sign = 1.0;
+        engine.dispatchCompute(camera);
+        const auto defaultSamples = engine.readGpuTemperatureSamples();
+        const auto defaultCounts = engine.rayStatusCounts;
+
+        simulationConfig.disk.accretion_rate_kg_per_s = defaultAccretionRate * 10.0;
+        engine.dispatchCompute(camera);
+        const auto tenfoldSamples = engine.readGpuTemperatureSamples();
+        const auto tenfoldCounts = engine.rayStatusCounts;
+
+        simulationConfig.disk.accretion_rate_kg_per_s = defaultAccretionRate;
+        simulationConfig.disk.rotation_sign = -1.0;
+        engine.dispatchCompute(camera);
+        const auto reversedSamples = engine.readGpuTemperatureSamples();
+        const auto reversedCounts = engine.rayStatusCounts;
+
+        const bool exported = engine.exportGpuTemperatureValidation(
+            "gpu_temperature_validation.csv", defaultSamples, tenfoldSamples, reversedSamples);
+        bool sampleChecksPassed = defaultSamples.size() == temperatureValidationSampleCount &&
+                                  tenfoldSamples.size() == defaultSamples.size() &&
+                                  reversedSamples.size() == defaultSamples.size();
+        double maximumRotationTemperatureDelta = 0.0;
+        bool scalingPassed = sampleChecksPassed;
+        bool dopplerReversalPassed = sampleChecksPassed;
+        if (sampleChecksPassed) {
+            const double expectedScaling = pow(10.0, 0.25);
+            for (size_t index = 0; index < defaultSamples.size(); ++index) {
+                const auto& baseline = defaultSamples[index];
+                const auto& tenfold = tenfoldSamples[index];
+                const auto& reversed = reversedSamples[index];
+                maximumRotationTemperatureDelta =
+                    std::max(maximumRotationTemperatureDelta,
+                             std::abs(static_cast<double>(baseline.localTemperature) -
+                                      reversed.localTemperature));
+                scalingPassed = scalingPassed && baseline.localTemperature > 0.0f &&
+                                std::abs(tenfold.localTemperature / baseline.localTemperature -
+                                         expectedScaling) < 5.0e-5;
+                dopplerReversalPassed =
+                    dopplerReversalPassed &&
+                    baseline.positiveAngularMomentumShift > baseline.negativeAngularMomentumShift &&
+                    reversed.positiveAngularMomentumShift < reversed.negativeAngularMomentumShift &&
+                    std::abs(baseline.positiveAngularMomentumShift -
+                             reversed.negativeAngularMomentumShift) < 5.0e-5f &&
+                    std::abs(baseline.negativeAngularMomentumShift -
+                             reversed.positiveAngularMomentumShift) < 5.0e-5f &&
+                    baseline.rotationSign == 1.0f && reversed.rotationSign == -1.0f;
+            }
+        }
+        const bool countsPassed = defaultCounts[2] == temperatureValidationSampleCount &&
+                                  tenfoldCounts[2] == temperatureValidationSampleCount &&
+                                  reversedCounts[2] == temperatureValidationSampleCount;
+        const bool passed = exported && sampleChecksPassed && countsPassed && scalingPassed &&
+                            dopplerReversalPassed && maximumRotationTemperatureDelta <= 0.01;
+        const unsigned int glDebugErrors = engine.glDebugErrorCount;
+        const float defaultAtFourPointFive =
+            sampleChecksPassed ? defaultSamples[1].localTemperature : 0.0f;
+        const float tenfoldAtFourPointFive =
+            sampleChecksPassed ? tenfoldSamples[1].localTemperature : 0.0f;
+        const float scalingAtFourPointFive =
+            defaultAtFourPointFive > 0.0f ? tenfoldAtFourPointFive / defaultAtFourPointFive : 0.0f;
+        cout << setprecision(9) << "[TEMPERATURE] samples=" << defaultSamples.size()
+             << " r=4.5_r_s default_K=" << defaultAtFourPointFive
+             << " tenfold_K=" << tenfoldAtFourPointFive << " ratio=" << scalingAtFourPointFive
+             << " max_rotation_delta_K=" << maximumRotationTemperatureDelta
+             << " doppler_reversal=" << (dopplerReversalPassed ? "PASS" : "FAIL")
+             << " overall=" << (passed ? "PASS" : "FAIL") << '\n';
+        engine.shutdown();
+        cout << "[OPENGL] debug_errors=" << glDebugErrors << '\n';
+        return passed && glDebugErrors == 0 ? 0 : 1;
+    }
+    if (thicknessValidationMode) {
+        simulationConfig.render_mode = blackhole::physics::RenderMode::Physical;
+        simulationConfig.disk.visible = true;
+        simulationConfig.background_mode = 1;
+        simulationConfig.resolution.dynamic_resolution = false;
+
+        diskThicknessInRadii = 0.02f;
+        engine.dispatchCompute(camera);
+        const auto thinStatuses = engine.readGpuStatuses();
+        const auto thinCounts = engine.rayStatusCounts;
+        const bool thinExported = engine.exportGpuValidation("gpu_thickness_thin.csv");
+
+        diskThicknessInRadii = 0.75f;
+        engine.dispatchCompute(camera);
+        const auto thickStatuses = engine.readGpuStatuses();
+        const auto thickCounts = engine.rayStatusCounts;
+        const bool thickExported = engine.exportGpuValidation("gpu_thickness_thick.csv");
+
+        size_t changedPixels = 0;
+        if (thinStatuses.size() == thickStatuses.size()) {
+            for (size_t pixel = 0; pixel < thinStatuses.size(); ++pixel) {
+                if (thinStatuses[pixel] != thickStatuses[pixel])
+                    ++changedPixels;
+            }
+        }
+        const bool passed = thinExported && thickExported && changedPixels > 0 &&
+                            thickCounts[2] > thinCounts[2] && thinCounts[4] == 0 &&
+                            thinCounts[5] == 0 && thickCounts[4] == 0 && thickCounts[5] == 0;
+        const unsigned int glDebugErrors = engine.glDebugErrorCount;
+        cout << "[THICKNESS] resolution=" << engine.lastComputeWidth << 'x'
+             << engine.lastComputeHeight << " thin=0.02_r_s disk_hits=" << thinCounts[2]
+             << " thick=0.75_r_s disk_hits=" << thickCounts[2]
+             << " changed_pixels=" << changedPixels << " overall=" << (passed ? "PASS" : "FAIL")
+             << '\n';
+        engine.shutdown();
+        cout << "[OPENGL] debug_errors=" << glDebugErrors << '\n';
+        return passed && glDebugErrors == 0 ? 0 : 1;
+    }
     bool interactionSmokePassed = true;
     if (interactionSmokeMode) {
         const auto initialMode = simulationConfig.render_mode;
@@ -859,13 +1073,48 @@ int main(int argc, char** argv) {
             static_cast<float>(simulationConfig.disk.half_thickness_in_schwarzschild_radii);
         camera.reset();
     }
-    if (!gpuValidationMode && !performanceSmokeMode)
+    if (!gpuValidationMode && !thicknessValidationMode && !performanceSmokeMode)
         engine.initializeUi();
-    if (!gpuValidationMode)
+    if (!gpuValidationMode && !thicknessValidationMode)
         engine.generateGrid();
     if (interactionSmokeMode) {
         simulationConfig.resolution.dynamic_resolution = false;
         camera.moving = false;
+
+        diskThicknessInRadii = 0.02f;
+        engine.dispatchCompute(camera);
+        const auto thinStatuses = engine.readGpuStatuses();
+        const unsigned int thinDiskHits = engine.rayStatusCounts[2];
+        for (int adjustment = 0; adjustment < 26; ++adjustment) {
+            camera.process_key(GLFW_KEY_T, 0, adjustment == 0 ? GLFW_PRESS : GLFW_REPEAT, 0);
+        }
+        engine.dispatchCompute(camera);
+        const auto thickStatuses = engine.readGpuStatuses();
+        const unsigned int thickDiskHits = engine.rayStatusCounts[2];
+        for (int adjustment = 0; adjustment < 26; ++adjustment) {
+            camera.process_key(GLFW_KEY_T, 0, adjustment == 0 ? GLFW_PRESS : GLFW_REPEAT,
+                               GLFW_MOD_SHIFT);
+        }
+        engine.dispatchCompute(camera);
+        const auto restoredThinStatuses = engine.readGpuStatuses();
+        size_t thicknessChangedPixels = 0;
+        if (thinStatuses.size() == thickStatuses.size()) {
+            for (size_t pixel = 0; pixel < thinStatuses.size(); ++pixel) {
+                if (thinStatuses[pixel] != thickStatuses[pixel])
+                    ++thicknessChangedPixels;
+            }
+        }
+        const bool thicknessGeometryPassed = thicknessChangedPixels > 0 &&
+                                             thickDiskHits > thinDiskHits &&
+                                             thinStatuses == restoredThinStatuses &&
+                                             std::abs(diskThicknessInRadii - 0.02f) < 1.0e-6f;
+        interactionSmokePassed = interactionSmokePassed && thicknessGeometryPassed;
+        cout << "[INTERACTION] thickness_geometry=" << (thicknessGeometryPassed ? "PASS" : "FAIL")
+             << " thin_disk_hits=" << thinDiskHits << " thick_disk_hits=" << thickDiskHits
+             << " changed_pixels=" << thicknessChangedPixels << '\n';
+
+        diskThicknessInRadii =
+            static_cast<float>(simulationConfig.disk.half_thickness_in_schwarzschild_radii);
         engine.dispatchCompute(camera);
         const auto stationaryCounts = engine.rayStatusCounts;
         camera.moving = true;

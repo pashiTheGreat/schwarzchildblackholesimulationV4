@@ -120,8 +120,10 @@ void Camera::process_key(int key, int, int action, int mods) {
     if ((action == GLFW_PRESS || action == GLFW_REPEAT) && key == GLFW_KEY_T) {
         const float scale = (mods & GLFW_MOD_SHIFT) ? (1.0f / 1.15f) : 1.15f;
         disk_thickness_in_radii_ = glm::clamp(disk_thickness_in_radii_ * scale, 0.02f, 0.75f);
-        std::cout << "[INFO] Disk half-thickness: " << disk_thickness_in_radii_
-                  << " Schwarzschild radii\n";
+        if (action == GLFW_PRESS) {
+            std::cout << "[INFO] Disk half-thickness: " << disk_thickness_in_radii_
+                      << " Schwarzschild radii\n";
+        }
     }
 }
 

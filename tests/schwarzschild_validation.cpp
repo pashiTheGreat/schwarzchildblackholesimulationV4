@@ -106,13 +106,20 @@ TestResult test_schwarzschild_radius() {
 
 TestResult test_configuration() {
     const auto configuration = blackhole::physics::make_default_simulation_configuration();
+    auto too_thin = configuration;
+    too_thin.disk.half_thickness_in_schwarzschild_radii = 0.019;
+    auto too_thick = configuration;
+    too_thick.disk.half_thickness_in_schwarzschild_radii = 0.751;
     const bool passed = blackhole::physics::is_valid(configuration) &&
                         configuration.render_mode == blackhole::physics::RenderMode::Physical &&
-                        configuration.camera.radius_in_schwarzschild_radii > 1.0;
+                        configuration.camera.radius_in_schwarzschild_radii > 1.0 &&
+                        !blackhole::physics::is_valid(too_thin) &&
+                        !blackhole::physics::is_valid(too_thick);
     return {"Default simulation configuration", passed,
             "camera=" + format_value(configuration.camera.radius_in_schwarzschild_radii) +
                 " r_s, r_s=" + format_value(configuration.black_hole.schwarzschild_radius_m) +
-                " m, default_mode=Physical"};
+                " m, disk_half_thickness=0.12 r_s, valid_range=[0.02,0.75] r_s, "
+                "default_mode=Physical"};
 }
 
 TestResult test_static_tetrad_null_constraint() {
@@ -495,7 +502,8 @@ TestResult test_thin_disk_thermodynamics_and_redshift() {
         close_to(bolometric_intensity_factor(prograde), std::pow(prograde, 4.0), 1.0e-14) &&
         !is_valid(invalid_disk);
     return {"Thin-disk thermodynamics and four-vector redshift", passed,
-            "T(10x Mdot)/T=" + format_value(hotter_temperature / temperature) +
+            "T(4.5 r_s)=" + format_value(temperature) +
+                " K, T(10x Mdot)/T=" + format_value(hotter_temperature / temperature) +
                 ", expected 10^(1/4)=" + format_value(expected_temperature_ratio) +
                 ", g_prograde=" + format_value(prograde) +
                 ", g_retrograde=" + format_value(retrograde) + ", r_in<3r_s rejected"};

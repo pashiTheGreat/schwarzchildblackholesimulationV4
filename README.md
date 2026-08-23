@@ -89,9 +89,10 @@ The historical 2D visualization remains a separate, non-validation target:
 
 ## Controls and HUD
 
-The in-window HUD reports mode, camera radius in `r_s`, FOV, disk radii and
-inclination, integration tolerances, compute resolution, frame time/FPS, and
-unresolved/invalid counts. It also exposes all rendering toggles.
+The in-window HUD reports mode, camera radius in `r_s`, FOV, disk radii,
+half-thickness and inclination, integration tolerances, compute resolution,
+frame time/FPS, and unresolved/invalid counts. It also exposes all rendering
+toggles.
 
 | Input | Action |
 | --- | --- |
@@ -104,7 +105,7 @@ unresolved/invalid counts. It also exposes all rendering toggles.
 | `V` | Validation failure colors |
 | `R` | Reverse disk rotation |
 | `I` / `Shift+I` | Increase/decrease disk inclination |
-| `T` / `Shift+T` | Increase/decrease approximate disk thickness |
+| `T` / `Shift+T` | Increase/decrease disk half-thickness over `0.02-0.75 r_s` |
 | `Home` | Reset the known camera view |
 
 The optional grid is labelled **Flamm's paraboloid**: an embedding of a
@@ -125,9 +126,20 @@ Run these from the executable directory:
 .\SchwarzschildValidation.exe
 .\BlackHole3D.exe --validation-export
 .\GpuValidationCompare.exe gpu_validation.csv
+.\BlackHole3D.exe --thickness-validation-export
+.\GpuValidationCompare.exe --thickness gpu_thickness_thin.csv gpu_thickness_thick.csv
+.\BlackHole3D.exe --temperature-validation-export
+.\GpuValidationCompare.exe --temperature gpu_temperature_validation.csv
 .\BlackHole3D.exe --interaction-smoke
 .\BlackHole3D.exe --performance-smoke
 ```
+
+The thickness export compares per-pixel GPU classifications at half-thicknesses
+`0.02 r_s` and `0.75 r_s`. It therefore fails if both inputs are silently
+promoted to the same slab, as happened with the former `1.0 r_s` shader floor.
+The temperature export runs the production shader's local-emission calculation
+at five fixed radii and compares it with the CPU thin-disk implementation for
+the default and tenfold accretion rates.
 
 Additional reproducible captures are available:
 

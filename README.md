@@ -1,71 +1,211 @@
-# **black**_**hole**
+# Schwarzschild Black Hole Simulation
 
-Black hole simulation project
+A real-time C++ and OpenGL simulation of a Schwarzschild black hole. Photon
+paths are integrated in a GPU compute shader to render gravitational lensing,
+the event-horizon silhouette, an emissive accretion disk, orbiting objects, and
+a procedurally generated deep-space background.
 
-Here is the black hole raw code, everything will be inside a src bin incase you want to copy the files
+## Features
 
-I'm writing this as I'm beginning this project (hopefully I complete it ;D) here is what I plan to do:
+- GPU ray tracing with an OpenGL 4.3 compute shader
+- Schwarzschild gravitational lensing
+- Procedural stars, galactic clouds, and nebula-like background detail
+- Emissive, turbulent accretion disk
+- Interactive orbit camera and zoom
+- Optional gravitational motion for scene objects
+- NVIDIA Optimus and AMD high-performance GPU hints on Windows
+- Separate 2D lensing demonstration
 
-1. Ray-tracing : add ray tracing to the gravity simulation to simulate gravitational lensing
+## Requirements
 
-2. Accretion disk : simulate accreciate disk using the ray tracing + the halos
+- A GPU and driver supporting **OpenGL 4.3 or newer**
+- A C++17 compiler
+- [CMake 3.21+](https://cmake.org/download/)
+- [Git](https://git-scm.com/downloads)
+- One of the dependency setups below
 
-3. Spacetime curvature : demonstrate visually the "trapdoor in spacetime" that is black holes using spacetime grid
+The 3D simulation is GPU intensive. Update the graphics driver before
+troubleshooting rendering or compute-shader errors.
 
-4. [optional] try to make it run realtime ;D
+> **Important:** Do not run the legacy `black_hole.exe` located in the
+> repository root. Build and run the `BlackHole3D` target using the steps
+> below. CMake places the required shader files beside the built executable.
 
-I hope it works :/
+## Windows: build with vcpkg
 
-Edit: After completion of project -
+These commands work in PowerShell. Visual Studio 2022 with the **Desktop
+development with C++** workload is the recommended compiler setup.
 
-## **Building Requirements:**
+### 1. Clone this repository
 
-1. C++ Compiler supporting C++ 17 or newer
+```powershell
+git clone https://github.com/pashiTheGreat/schwarzchild-black-hole-simulation.git
+cd schwarzchild-black-hole-simulation
+```
 
-2. [Cmake](https://cmake.org/)
+### 2. Install vcpkg
 
-3. [Vcpkg](https://vcpkg.io/en/)
+If vcpkg is not already installed:
 
-4. [Git](https://git-scm.com/)
+```powershell
+git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+C:\vcpkg\bootstrap-vcpkg.bat
+```
 
-## **Build Instructions:**
+### 3. Configure the project
 
-1. Clone the repository:
-	-  `git clone https://github.com/kavan010/black_hole.git`
-2. CD into the newly cloned directory
-	- `cd ./black_hole` 
-3. Install dependencies with Vcpkg
-	- `vcpkg install`
-4. Get the vcpkg cmake toolchain file path
-	- `vcpkg integrate install`
-	- This will output something like : `CMake projects should use: "-DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake"`
-5. Create a build directory
-	- `mkdir build`
-6. Configure project with CMake
-	-  `cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake`
-	- Use the vcpkg cmake toolchain path from above
-7. Build the project
-	- `cmake --build build`
-8. Run the program
-	- The executables will be located in the build folder
+The repository contains `vcpkg.json`, so vcpkg installs GLFW, GLEW, and GLM
+automatically during configuration.
 
-### Alternative: Debian/Ubuntu apt workaround
+```powershell
+cmake -S . -B build `
+  -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
+  -DVCPKG_TARGET_TRIPLET=x64-windows
+```
 
-If you don't want to use vcpkg, or you just need a quick way to install the native development packages on Debian/Ubuntu, install these packages and then run the normal CMake steps above:
+If vcpkg is installed somewhere else, replace `C:/vcpkg` with its actual path.
+
+### 4. Build the 3D simulation
+
+```powershell
+cmake --build build --config Release --target BlackHole3D
+```
+
+### 5. Launch it
+
+```powershell
+.\build\Release\BlackHole3D.exe
+```
+
+Keep the working directory at `build\Release` when launching. That directory
+contains `geodesic.comp`, `grid.vert`, and `grid.frag` copied by CMake.
+
+## Ubuntu/Debian: build with system packages
+
+### 1. Install the compiler and dependencies
 
 ```bash
 sudo apt update
-sudo apt install build-essential cmake \
-	libglew-dev libglfw3-dev libglm-dev libgl1-mesa-dev
+sudo apt install build-essential cmake git \
+  libglew-dev libglfw3-dev libglm-dev libgl1-mesa-dev
 ```
 
-This provides the GLEW, GLFW, GLM and OpenGL development files so `find_package(...)` calls in `CMakeLists.txt` can locate the libraries. After installing, run the `cmake -B build -S .` and `cmake --build build` commands as shown in the Build Instructions.
+### 2. Clone, configure, and build
 
-## **How the code works:**
-for 2D: simple, just run 2D_lensing.cpp with the nessesary dependencies installed.
+```bash
+git clone https://github.com/pashiTheGreat/schwarzchild-black-hole-simulation.git
+cd schwarzchild-black-hole-simulation
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel --target BlackHole3D
+```
 
-for 3D: black_hole.cpp and geodesic.comp work together to run the simuation faster using GPU, essentially it sends over a UBO and geodesic.comp runs heavy calculations using that data.
+### 3. Launch it
 
-should work with nessesary dependencies installed, however I have only run it on windows with my GPU so am not sure!
+```bash
+cd build
+./BlackHole3D
+```
 
-LMK if you would like an in-depth explanation of how the code works aswell :)
+Linux support depends on the installed OpenGL driver. Proprietary NVIDIA/AMD
+drivers may provide better compute-shader performance than fallback Mesa
+drivers on some systems.
+
+## Controls
+
+| Input | Action |
+| --- | --- |
+| Left-click and drag | Orbit around the black hole |
+| Middle-click and drag | Orbit around the black hole |
+| Mouse wheel | Zoom in or out |
+| Hold right mouse button | Enable object gravity while held |
+| `G` | Toggle object gravity on or off |
+| Window close button | Exit the simulation |
+
+## Verify which GPU is being used
+
+At startup, the console prints lines similar to:
+
+```text
+OpenGL vendor: NVIDIA Corporation
+OpenGL renderer: NVIDIA GeForce RTX 3050 Ti Laptop GPU/PCIe/SSE2
+OpenGL version: 4.3.0 NVIDIA ...
+```
+
+The `OpenGL renderer` line is the authoritative adapter used by the
+simulation.
+
+On a Windows laptop with hybrid graphics, the executable requests the
+high-performance GPU automatically. If it still reports Intel or AMD
+integrated graphics:
+
+1. Open **Settings > System > Display > Graphics**.
+2. Select **Browse** and choose `build\Release\BlackHole3D.exe`.
+3. Open **Options**, select **High performance**, and save.
+4. Close every running simulation window and launch it again.
+
+For NVIDIA GPUs, `nvidia-smi pmon -c 1` can also show `BlackHole3D.exe` while
+the simulation is running.
+
+## Build and run the 2D demonstration
+
+Windows:
+
+```powershell
+cmake --build build --config Release --target BlackHole2D
+.\build\Release\BlackHole2D.exe
+```
+
+Linux:
+
+```bash
+cmake --build build --parallel --target BlackHole2D
+./build/BlackHole2D
+```
+
+## Troubleshooting
+
+### `Failed to create GLFW window`
+
+Update the GPU driver and confirm that the GPU supports OpenGL 4.3.
+
+### `Failed to open compute shader: geodesic.comp`
+
+Launch the executable from its CMake output directory. Do not move the
+executable without also copying `geodesic.comp`, `grid.vert`, and `grid.frag`.
+
+### The integrated GPU is used on a laptop
+
+Follow the Windows Graphics preference steps in the GPU verification section.
+The preference is stored for the exact executable path, so it may need to be
+set again after moving the build directory.
+
+### The window is slow while moving the camera
+
+The simulation integrates many geodesic steps per pixel and can fully utilize
+a GPU. Build in `Release` mode, close other GPU-heavy applications, and use the
+latest graphics driver.
+
+## Project layout
+
+| File | Purpose |
+| --- | --- |
+| `black_hole.cpp` | 3D application, camera, OpenGL setup, and GPU dispatch |
+| `geodesic.comp` | Schwarzschild geodesics, lensing, disk, and starfield |
+| `grid.vert`, `grid.frag` | Spacetime grid shaders |
+| `2D_lensing.cpp` | Standalone 2D lensing demonstration |
+| `CMakeLists.txt` | Portable build targets and shader copying |
+| `vcpkg.json` | GLFW, GLEW, and GLM dependency manifest |
+
+## Tested configuration
+
+The current 3D build has been tested on Windows with:
+
+- NVIDIA GeForce RTX 3050 Ti Laptop GPU
+- OpenGL 4.3
+- NVIDIA driver 595.97
+- C++17 MinGW build
+
+Other OpenGL 4.3-capable systems should be able to build and run it using the
+instructions above, but hardware and driver combinations can behave
+differently. Please include the printed OpenGL vendor, renderer, and version
+when reporting a problem.

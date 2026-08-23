@@ -13,6 +13,16 @@
 #include <chrono>
 #include <fstream>
 #include <sstream>
+
+// Ask hybrid-graphics laptop drivers to create the OpenGL context on the
+// high-performance adapter instead of the integrated GPU.
+#if defined(_WIN32)
+extern "C" {
+__declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 0x00000001;
+}
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -197,7 +207,9 @@ struct Engine {
             glfwTerminate();
             exit(EXIT_FAILURE);
         }
-        cout << "OpenGL " << glGetString(GL_VERSION) << "\n";
+        cout << "OpenGL vendor: " << glGetString(GL_VENDOR) << "\n"
+             << "OpenGL renderer: " << glGetString(GL_RENDERER) << "\n"
+             << "OpenGL version: " << glGetString(GL_VERSION) << "\n" << flush;
         this->shaderProgram = CreateShaderProgram();
         gridShaderProgram = CreateShaderProgram("grid.vert", "grid.frag");
 

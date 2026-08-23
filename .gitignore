@@ -145,3 +145,9 @@ _deps
 
 # Vcpkg
 vcpkg_installed
+
+# Local runtime packages, generated builds, and diagnostics
+.runtime_packages/
+build2d/
+build3d/
+*.log

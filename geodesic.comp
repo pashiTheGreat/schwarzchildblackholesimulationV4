@@ -31,6 +31,103 @@ const float SagA_rs = 1.269e10;
 const float D_LAMBDA = 1e7;
 const double ESCAPE_R = 1e30;
 
+// Procedural deep-space background. It is sampled with the ray's final
+// direction, after geodesic integration, so the stars bend around the hole.
+float hash31(vec3 p) {
+    p = fract(p * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+vec3 hash33(vec3 p) {
+    return vec3(
+        hash31(p + vec3(17.0, 59.4, 15.0)),
+        hash31(p + vec3(91.0, 11.7, 47.0)),
+        hash31(p + vec3(37.0, 83.2, 73.0))
+    );
+}
+
+float valueNoise(vec3 p) {
+    vec3 cell = floor(p);
+    vec3 local = fract(p);
+    local = local * local * (3.0 - 2.0 * local);
+
+    float n000 = hash31(cell + vec3(0, 0, 0));
+    float n100 = hash31(cell + vec3(1, 0, 0));
+    float n010 = hash31(cell + vec3(0, 1, 0));
+    float n110 = hash31(cell + vec3(1, 1, 0));
+    float n001 = hash31(cell + vec3(0, 0, 1));
+    float n101 = hash31(cell + vec3(1, 0, 1));
+    float n011 = hash31(cell + vec3(0, 1, 1));
+    float n111 = hash31(cell + vec3(1, 1, 1));
+
+    float nx00 = mix(n000, n100, local.x);
+    float nx10 = mix(n010, n110, local.x);
+    float nx01 = mix(n001, n101, local.x);
+    float nx11 = mix(n011, n111, local.x);
+    return mix(mix(nx00, nx10, local.y), mix(nx01, nx11, local.y), local.z);
+}
+
+float fbm(vec3 p) {
+    float value = 0.0;
+    float amplitude = 0.5;
+    for (int octave = 0; octave < 4; ++octave) {
+        value += amplitude * valueNoise(p);
+        p = p * 2.03 + vec3(13.1, 7.7, 19.3);
+        amplitude *= 0.5;
+    }
+    return value;
+}
+
+vec3 starLayer(vec2 uv, float scale, float density) {
+    vec2 grid = uv * scale;
+    vec2 cell = floor(grid);
+    vec2 local = fract(grid) - 0.5;
+    vec3 seed = vec3(cell, scale);
+    vec3 randomValues = hash33(seed);
+
+    vec2 starOffset = (randomValues.xy - 0.5) * 0.72;
+    float distanceToStar = length(local - starOffset);
+    float exists = step(density, randomValues.z);
+    float radius = mix(0.055, 0.16, hash31(seed + 8.0));
+    float core = 1.0 - smoothstep(radius * 0.18, radius, distanceToStar);
+    float glow = exp(-distanceToStar * 24.0) * 0.28;
+
+    float temperature = hash31(seed + 21.0);
+    vec3 warm = vec3(1.0, 0.62, 0.32);
+    vec3 neutral = vec3(1.0, 0.94, 0.82);
+    vec3 blue = vec3(0.55, 0.72, 1.0);
+    vec3 starColor = temperature < 0.32
+        ? mix(warm, neutral, temperature / 0.32)
+        : mix(neutral, blue, (temperature - 0.32) / 0.68);
+    float brightness = mix(0.7, 2.8, hash31(seed + 41.0));
+    return starColor * exists * (core + glow) * brightness;
+}
+
+vec3 spaceBackground(vec3 direction) {
+    vec3 d = normalize(direction);
+    const float PI = 3.14159265359;
+    vec2 skyUv = vec2(atan(d.z, d.x) / (2.0 * PI) + 0.5,
+                      asin(clamp(d.y, -1.0, 1.0)) / PI + 0.5);
+
+    vec3 galaxyNormal = normalize(vec3(0.23, 0.91, -0.34));
+    float latitude = abs(dot(d, galaxyNormal));
+    float broadBand = exp(-latitude * 7.0);
+    float brightCore = exp(-latitude * 24.0);
+    float clouds = fbm(d * 5.0 + vec3(2.0, 8.0, 1.0));
+    float wisps = fbm(d * 13.0 - vec3(7.0, 3.0, 9.0));
+
+    vec3 color = vec3(0.0025, 0.004, 0.014);
+    color += vec3(0.025, 0.035, 0.085) * broadBand * (0.35 + clouds);
+    color += vec3(0.12, 0.045, 0.16) * brightCore * pow(clouds, 2.0);
+    color += vec3(0.08, 0.11, 0.16) * brightCore * pow(wisps, 3.0);
+
+    color += starLayer(skyUv, 95.0, 0.82);
+    color += starLayer(skyUv + vec2(0.173, 0.291), 190.0, 0.91);
+    color += starLayer(skyUv + vec2(0.417, 0.113), 360.0, 0.965);
+    return color;
+}
+
 // Globals to store hit info
 vec4 objectColor = vec4(0.0);
 vec3 hitCenter = vec3(0.0);
@@ -129,6 +226,7 @@ void main() {
 
     vec4 color = vec4(0.0);
     vec3 prevPos = vec3(ray.x, ray.y, ray.z);
+    vec3 finalRayDirection = dir;
     float lambda = 0.0;
 
     bool hitBlackHole = false;
@@ -143,6 +241,8 @@ void main() {
         lambda += D_LAMBDA;
 
         vec3 newPos = vec3(ray.x, ray.y, ray.z);
+        vec3 travel = newPos - prevPos;
+        if (dot(travel, travel) > 0.0) finalRayDirection = normalize(travel);
         if (crossesEquatorialPlane(prevPos, newPos)) { hitDisk = true; break; }
         if (interceptObject(ray)) { hitObject = true; break; }
         prevPos = newPos;
@@ -150,10 +250,17 @@ void main() {
     }
 
     if (hitDisk) {
-        double r = length(vec3(ray.x, ray.y, ray.z)) / disk_r2;
-        vec3 diskColor = vec3(1.0, r, 0.2);
-        //r = 1.0 - abs(r - 0.5) * 2.0;
-        color = vec4(diskColor, r);
+        float radialPosition = clamp(
+            (length(vec2(ray.x, ray.z)) - disk_r1) / (disk_r2 - disk_r1),
+            0.0, 1.0
+        );
+        float edgeFade = smoothstep(0.0, 0.08, radialPosition)
+                       * (1.0 - smoothstep(0.82, 1.0, radialPosition));
+        float turbulence = 0.72 + 0.28 * valueNoise(vec3(ray.x, ray.z, lambda) / 8.0e9);
+        vec3 innerHot = vec3(1.0, 0.92, 0.72);
+        vec3 outerHot = vec3(1.0, 0.12, 0.015);
+        vec3 diskColor = mix(innerHot, outerHot, pow(radialPosition, 0.65));
+        color = vec4(diskColor * (1.2 + 2.8 * edgeFade) * turbulence, 1.0);
 
     } else if (hitBlackHole) {
         color = vec4(0.0, 0.0, 0.0, 1.0);
@@ -170,7 +277,7 @@ void main() {
         color = vec4(shaded, objectColor.a);
 
     } else {
-        color = vec4(0.0);
+        color = vec4(spaceBackground(finalRayDirection), 1.0);
     }
 
     imageStore(outImage, pix, color);

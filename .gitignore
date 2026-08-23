@@ -51,6 +51,7 @@ $RECYCLE.BIN/
 cmake-build-*/
 
 build
+/build_*/
 
 ##### CMake
 CMakeLists.txt.user
@@ -151,3 +152,10 @@ vcpkg_installed
 build2d/
 build3d/
 *.log
+*.bmp
+*.csv
+*.trace
+*.nsys-rep
+.vs/
+.idea/
+__pycache__/

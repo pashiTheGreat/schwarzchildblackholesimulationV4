@@ -1,214 +1,175 @@
-# Schwarzschild Black Hole Simulation
+# Validated Schwarzschild Geodesic Renderer
 
-A real-time C++ and OpenGL simulation of a Schwarzschild black hole. Photon
-paths are integrated in a GPU compute shader to render gravitational lensing,
-the event-horizon silhouette, an emissive accretion disk, orbiting objects, and
-a procedurally generated deep-space background.
+This project is a C++17/OpenGL scientific visualization of null geodesics
+around a nonrotating, uncharged, isolated Schwarzschild black hole. Its vacuum
+ray paths and shadow geometry are validated against an independent CPU
+reference and analytical results. The luminous accretion disk is an
+approximate thin-disk emitter, not a plasma or radiative-transfer simulation.
 
-## Features
+The default is **Physical** mode. **Cinematic** mode is explicitly artistic.
 
-- GPU ray tracing with an OpenGL 4.3 compute shader
-- Schwarzschild gravitational lensing
-- Procedural stars, galactic clouds, and nebula-like background detail
-- Relativistic accretion disk with Doppler beaming and gravitational redshift
-- Photon-ring and higher-order disk-image enhancement
-- Interactive orbit camera and zoom
-- Optional gravitational motion for scene objects
-- NVIDIA Optimus and AMD high-performance GPU hints on Windows
-- Separate 2D lensing demonstration
+## What is—and is not—modeled
+
+| Feature | Physical | Cinematic |
+| --- | --- | --- |
+| Null Schwarzschild geodesics | Validated GPU integration | Same integration |
+| Horizon capture and lensed background | Yes | Yes |
+| Thin-disk flux and effective temperature | Approximate zero-torque model | Used as a base |
+| Observer/emitter frequency shift and bolometric `g^4` | Yes | Yes |
+| Fixed orange grading | No | Yes |
+| Artificial photon-ring emission | No | Yes |
+| Higher-order brightness enhancement | No | Yes |
+| Aggressive filmic tone mapping | No | Yes |
+
+There is no Kerr spin or frame dragging, charged metric, dynamical spacetime,
+orbiting-object simulation, magnetohydrodynamics, full spectrum, or complete
+radiative transfer. See [PHYSICS_VALIDATION.md](PHYSICS_VALIDATION.md) for the
+equations, conventions, tolerances, evidence, and limitations.
 
 ## Requirements
 
-- A GPU and driver supporting **OpenGL 4.3 or newer**
-- A C++17 compiler
-- [CMake 3.21+](https://cmake.org/download/)
-- [Git](https://git-scm.com/downloads)
-- One of the dependency setups below
+- Windows 10/11 and a GPU driver supporting OpenGL 4.3 or newer
+- Visual Studio with the Desktop development with C++ workload
+- CMake 3.21 or newer
+- Git and [vcpkg](https://github.com/microsoft/vcpkg)
 
-The 3D simulation is GPU intensive. Update the graphics driver before
-troubleshooting rendering or compute-shader errors.
+The verified configuration is Visual Studio 18 (MSVC 19.50), Windows SDK
+10.0.26100.0, vcpkg x64-windows, and an NVIDIA GeForce RTX 3050 Ti Laptop GPU
+using OpenGL 4.3 / driver 595.97. Other platforms and drivers are not claimed
+as verified by the current report.
 
-> **Important:** Do not run the legacy `black_hole.exe` located in the
-> repository root. Build and run the `BlackHole3D` target using the steps
-> below. CMake places the required shader files beside the built executable.
+## Clean Windows build
 
-## Windows: build with vcpkg
-
-These commands work in PowerShell. Visual Studio 2022 with the **Desktop
-development with C++** workload is the recommended compiler setup.
-
-### 1. Clone this repository
-
-```powershell
-git clone https://github.com/pashiTheGreat/schwarzchild-black-hole-simulation.git
-cd schwarzchild-black-hole-simulation
-```
-
-### 2. Install vcpkg
-
-If vcpkg is not already installed:
+Run these commands in PowerShell from the repository root. If vcpkg is not
+already installed, install it once:
 
 ```powershell
 git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
 C:\vcpkg\bootstrap-vcpkg.bat
 ```
 
-### 3. Configure the project
-
-The repository contains `vcpkg.json`, so vcpkg installs GLFW, GLEW, and GLM
-automatically during configuration.
+Configure a fresh build. The manifest installs GLEW, GLFW, GLM, and ImGui:
 
 ```powershell
 cmake -S . -B build `
+  -A x64 `
   -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
   -DVCPKG_TARGET_TRIPLET=x64-windows
 ```
 
-If vcpkg is installed somewhere else, replace `C:/vcpkg` with its actual path.
-
-### 4. Build the 3D simulation
+Build and test both configurations:
 
 ```powershell
-cmake --build build --config Release --target BlackHole3D
+cmake --build build --config Debug
+cmake --build build --config Release
+ctest --test-dir build -C Debug --output-on-failure
+ctest --test-dir build -C Release --output-on-failure
 ```
 
-### 5. Launch it
+`ctest` runs the dependency-free CPU reference without opening a GLFW window.
+
+## Run
+
+Shaders are copied beside `BlackHole3D.exe`; use that directory as the working
+directory:
 
 ```powershell
-.\build\Release\BlackHole3D.exe
+Set-Location build\Release
+.\BlackHole3D.exe
 ```
 
-Keep the working directory at `build\Release` when launching. That directory
-contains `geodesic.comp`, `grid.vert`, and `grid.frag` copied by CMake.
+At startup, the application prints the OpenGL vendor, renderer, and version.
+The renderer line identifies the GPU actually used.
 
-## Ubuntu/Debian: build with system packages
+The historical 2D visualization remains a separate, non-validation target:
 
-### 1. Install the compiler and dependencies
-
-```bash
-sudo apt update
-sudo apt install build-essential cmake git \
-  libglew-dev libglfw3-dev libglm-dev libgl1-mesa-dev
+```powershell
+.\BlackHole2D.exe
 ```
 
-### 2. Clone, configure, and build
+## Controls and HUD
 
-```bash
-git clone https://github.com/pashiTheGreat/schwarzchild-black-hole-simulation.git
-cd schwarzchild-black-hole-simulation
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel --target BlackHole3D
-```
-
-### 3. Launch it
-
-```bash
-cd build
-./BlackHole3D
-```
-
-Linux support depends on the installed OpenGL driver. Proprietary NVIDIA/AMD
-drivers may provide better compute-shader performance than fallback Mesa
-drivers on some systems.
-
-## Controls
+The in-window HUD reports mode, camera radius in `r_s`, FOV, disk radii and
+inclination, integration tolerances, compute resolution, frame time/FPS, and
+unresolved/invalid counts. It also exposes all rendering toggles.
 
 | Input | Action |
 | --- | --- |
-| Left-click and drag | Orbit around the black hole |
-| Middle-click and drag | Orbit around the black hole |
-| Mouse wheel | Zoom in or out |
-| Hold right mouse button | Enable object gravity while held |
-| `G` | Toggle object gravity on or off |
+| Left- or middle-drag | Orbit the centered camera |
+| Mouse wheel | Zoom; clamped to `r > r_s` because no static observer exists at or inside the horizon |
+| `M` | Physical/Cinematic mode |
+| `D` | Disk visibility |
+| `B` | Procedural/uniform-dark background |
+| `G` | Flamm's paraboloid overlay |
+| `V` | Validation failure colors |
+| `R` | Reverse disk rotation |
 | `I` / `Shift+I` | Increase/decrease disk inclination |
-| `T` / `Shift+T` | Increase/decrease disk thickness |
-| Window close button | Exit the simulation |
+| `T` / `Shift+T` | Increase/decrease approximate disk thickness |
+| `Home` | Reset the known camera view |
 
-## Verify which GPU is being used
+The optional grid is labelled **Flamm's paraboloid**: an embedding of a
+constant-time equatorial spatial slice. It is not a literal view of
+four-dimensional curvature.
 
-At startup, the console prints lines similar to:
+Interactive rendering normally samples at half the framebuffer dimensions and
+halves that again while the camera is moving. This affects image sampling only;
+it does not change geodesic tolerances, equations, budgets, or classification.
+Select “Full-resolution still” in the HUD or pass `--full-resolution` to use the
+entire framebuffer.
 
-```text
-OpenGL vendor: NVIDIA Corporation
-OpenGL renderer: NVIDIA GeForce RTX 3050 Ti Laptop GPU/PCIe/SSE2
-OpenGL version: 4.3.0 NVIDIA ...
-```
+## Validation and diagnostic commands
 
-The `OpenGL renderer` line is the authoritative adapter used by the
-simulation.
-
-On a Windows laptop with hybrid graphics, the executable requests the
-high-performance GPU automatically. If it still reports Intel or AMD
-integrated graphics:
-
-1. Open **Settings > System > Display > Graphics**.
-2. Select **Browse** and choose `build\Release\BlackHole3D.exe`.
-3. Open **Options**, select **High performance**, and save.
-4. Close every running simulation window and launch it again.
-
-For NVIDIA GPUs, `nvidia-smi pmon -c 1` can also show `BlackHole3D.exe` while
-the simulation is running.
-
-## Build and run the 2D demonstration
-
-Windows:
+Run these from the executable directory:
 
 ```powershell
-cmake --build build --config Release --target BlackHole2D
-.\build\Release\BlackHole2D.exe
+.\SchwarzschildValidation.exe
+.\BlackHole3D.exe --validation-export
+.\GpuValidationCompare.exe gpu_validation.csv
+.\BlackHole3D.exe --interaction-smoke
+.\BlackHole3D.exe --performance-smoke
 ```
 
-Linux:
+Additional reproducible captures are available:
 
-```bash
-cmake --build build --parallel --target BlackHole2D
-./build/BlackHole2D
+```powershell
+.\BlackHole3D.exe --capture-physical
+.\BlackHole3D.exe --capture-cinematic
+.\BlackHole3D.exe --capture-vacuum
+.\BlackHole3D.exe --capture-grid
 ```
+
+These write ignored BMP/CSV artifacts in the current build directory. The
+vacuum capture uses Physical mode, hides the disk, and uses a uniform dark
+background; it must contain no emissive ring.
+
+## Architecture
+
+| Owner | Responsibility |
+| --- | --- |
+| `physics/simulation_config.*` | Units, defaults, mode, camera, disk, integration and resolution configuration |
+| `physics/schwarzschild.*` | Dependency-free CPU reference geodesics and classification |
+| `physics/accretion_disk.*` | Approximate disk flux, temperature, redshift, and bolometric factor |
+| `app/camera.*` | Static-observer camera and input state transitions |
+| `rendering/shader_loader.*` | Checked shader loading, compilation, and program linking |
+| `black_hole.cpp` | OpenGL renderer, GPU resource ownership, UI, captures, and runtime diagnostics |
+| `geodesic.comp` | Dimensionless production GPU geodesics and radiance approximation |
+| `tests/*` | CPU physics and CPU/GPU validation executables |
+
+OpenGL resources and the GLFW window are released by the renderer owner before
+context teardown. All project targets compile with `/W4 /permissive-` on MSVC
+or `-Wall -Wextra -Wpedantic` elsewhere.
 
 ## Troubleshooting
 
-### `Failed to create GLFW window`
+- **Failed to create GLFW window:** update the graphics driver and verify
+  OpenGL 4.3 support.
+- **Failed to open a shader:** launch from the CMake configuration output
+  directory (`build\Debug` or `build\Release`).
+- **Integrated GPU selected:** add the exact `BlackHole3D.exe` path under
+  Windows Settings → System → Display → Graphics and select High performance.
+- **Yellow or magenta validation pixels:** inspect unresolved/invalid counts,
+  then run the CPU/GPU validation export. These pixels are deliberately never
+  classified as horizon capture.
 
-Update the GPU driver and confirm that the GPU supports OpenGL 4.3.
-
-### `Failed to open compute shader: geodesic.comp`
-
-Launch the executable from its CMake output directory. Do not move the
-executable without also copying `geodesic.comp`, `grid.vert`, and `grid.frag`.
-
-### The integrated GPU is used on a laptop
-
-Follow the Windows Graphics preference steps in the GPU verification section.
-The preference is stored for the exact executable path, so it may need to be
-set again after moving the build directory.
-
-### The window is slow while moving the camera
-
-The simulation integrates many geodesic steps per pixel and can fully utilize
-a GPU. Build in `Release` mode, close other GPU-heavy applications, and use the
-latest graphics driver.
-
-## Project layout
-
-| File | Purpose |
-| --- | --- |
-| `black_hole.cpp` | 3D application, camera, OpenGL setup, and GPU dispatch |
-| `geodesic.comp` | Schwarzschild geodesics, lensing, disk, and starfield |
-| `grid.vert`, `grid.frag` | Spacetime grid shaders |
-| `2D_lensing.cpp` | Standalone 2D lensing demonstration |
-| `CMakeLists.txt` | Portable build targets and shader copying |
-| `vcpkg.json` | GLFW, GLEW, and GLM dependency manifest |
-
-## Tested configuration
-
-The current 3D build has been tested on Windows with:
-
-- NVIDIA GeForce RTX 3050 Ti Laptop GPU
-- OpenGL 4.3
-- NVIDIA driver 595.97
-- C++17 MinGW build
-
-Other OpenGL 4.3-capable systems should be able to build and run it using the
-instructions above, but hardware and driver combinations can behave
-differently. Please include the printed OpenGL vendor, renderer, and version
-when reporting a problem.
+No redistribution license has been chosen yet; see
+[LICENSE_STATUS.md](LICENSE_STATUS.md).

@@ -3,16 +3,26 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
-#include <vector>
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_opengl3.h>
 #include <iostream>
+#include <vector>
 #define _USE_MATH_DEFINES
-#include <cmath>
-#include <sstream>
-#include <iomanip>
-#include <cstring>
+#include <array>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <fstream>
-#include <sstream>
+#include <iomanip>
+#include <iterator>
+#include <numeric>
+#include <string>
+
+#include "app/camera.hpp"
+#include "physics/schwarzschild.hpp"
+#include "physics/simulation_config.hpp"
+#include "rendering/shader_loader.hpp"
 
 // Ask hybrid-graphics laptop drivers to create the OpenGL context on the
 // high-performance adapter instead of the integrated GPU.
@@ -28,211 +38,62 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 0x00000001;
 #endif
 using namespace glm;
 using namespace std;
-using Clock = std::chrono::high_resolution_clock;
-
-// VARS
-double lastPrintTime = 0.0;
-int    framesCount   = 0;
-double c = 299792458.0;
-double G = 6.67430e-11;
-struct Ray;
-bool Gravity = false;
-float diskInclinationRadians = radians(20.0f);
-float diskThicknessInRadii = 0.12f;
-
-struct Camera {
-    // Center the camera orbit on the black hole at (0, 0, 0)
-    vec3 target = vec3(0.0f, 0.0f, 0.0f); // Always look at the black hole center
-    float radius = 6.34194e10f;
-    float minRadius = 1e10f, maxRadius = 1e12f;
-
-    float azimuth = 0.0f;
-    float elevation = M_PI / 2.0f;
-
-    float orbitSpeed = 0.01f;
-    float panSpeed = 0.01f;
-    double zoomSpeed = 25e9f;
-
-    bool dragging = false;
-    bool panning = false;
-    bool moving = false; // For compute shader optimization
-    double lastX = 0.0, lastY = 0.0;
-
-    // Calculate camera position in world space
-    vec3 position() const {
-        float clampedElevation = glm::clamp(elevation, 0.01f, float(M_PI) - 0.01f);
-        // Orbit around (0,0,0) always
-        return vec3(
-            radius * sin(clampedElevation) * cos(azimuth),
-            radius * cos(clampedElevation),
-            radius * sin(clampedElevation) * sin(azimuth)
-        );
-    }
-    void update() {
-        // Always keep target at black hole center
-        target = vec3(0.0f, 0.0f, 0.0f);
-        if(dragging | panning) {
-            moving = true;
-        } else {
-            moving = false;
-        }
-    }
-
-    void processMouseMove(double x, double y) {
-        float dx = float(x - lastX);
-        float dy = float(y - lastY);
-
-        if (dragging && panning) {
-            // Pan: Shift + Left or Middle Mouse
-            // Disable panning to keep camera centered on black hole
-        }
-        else if (dragging && !panning) {
-            // Orbit: Left mouse only
-            azimuth   += dx * orbitSpeed;
-            elevation -= dy * orbitSpeed;
-            elevation = glm::clamp(elevation, 0.01f, float(M_PI) - 0.01f);
-        }
-
-        lastX = x;
-        lastY = y;
-        update();
-    }
-    void processMouseButton(int button, int action, int mods, GLFWwindow* win) {
-        if (button == GLFW_MOUSE_BUTTON_LEFT || button == GLFW_MOUSE_BUTTON_MIDDLE) {
-            if (action == GLFW_PRESS) {
-                dragging = true;
-                // Disable panning so camera always orbits center
-                panning = false;
-                glfwGetCursorPos(win, &lastX, &lastY);
-            } else if (action == GLFW_RELEASE) {
-                dragging = false;
-                panning = false;
-            }
-        }
-        if (button == GLFW_MOUSE_BUTTON_RIGHT) {
-            if (action == GLFW_PRESS) {
-                Gravity = true;
-            } else if (action == GLFW_RELEASE) {
-                Gravity = false;
-            }
-        }
-    }
-    void processScroll(double xoffset, double yoffset) {
-        radius -= yoffset * zoomSpeed;
-        radius = glm::clamp(radius, minRadius, maxRadius);
-        update();
-    }
-    void processKey(int key, int scancode, int action, int mods) {
-        if (action == GLFW_PRESS && key == GLFW_KEY_G) {
-            Gravity = !Gravity;
-            cout << "[INFO] Gravity turned " << (Gravity ? "ON" : "OFF") << endl;
-        }
-        if ((action == GLFW_PRESS || action == GLFW_REPEAT) && key == GLFW_KEY_I) {
-            float direction = (mods & GLFW_MOD_SHIFT) ? -1.0f : 1.0f;
-            diskInclinationRadians = glm::clamp(
-                diskInclinationRadians + radians(5.0f) * direction,
-                radians(0.0f), radians(85.0f));
-            cout << "[INFO] Disk inclination: "
-                 << degrees(diskInclinationRadians) << " degrees" << endl;
-        }
-        if ((action == GLFW_PRESS || action == GLFW_REPEAT) && key == GLFW_KEY_T) {
-            float scale = (mods & GLFW_MOD_SHIFT) ? (1.0f / 1.15f) : 1.15f;
-            diskThicknessInRadii = glm::clamp(
-                diskThicknessInRadii * scale, 0.02f, 0.75f);
-            cout << "[INFO] Disk half-thickness: "
-                 << diskThicknessInRadii << " Schwarzschild radii" << endl;
-        }
-    }
-};
-Camera camera;
-
-struct BlackHole {
-    vec3 position;
-    double mass;
-    double radius;
-    double r_s;
-
-    BlackHole(vec3 pos, float m) : position(pos), mass(m) {r_s = 2.0 * G * mass / (c*c);}
-    bool Intercept(float px, float py, float pz) const {
-        double dx = double(px) - double(position.x);
-        double dy = double(py) - double(position.y);
-        double dz = double(pz) - double(position.z);
-        double dist2 = dx * dx + dy * dy + dz * dz;
-        return dist2 < r_s * r_s;
-    }
-};
-BlackHole SagA(vec3(0.0f, 0.0f, 0.0f), 8.54e36); // Sagittarius A black hole
-struct ObjectData {
-    vec4 posRadius; // xyz = position, w = radius
-    vec4 color;     // rgb = color, a = unused
-    float  mass;
-    vec3 velocity = vec3(0.0f, 0.0f, 0.0f); // Initial velocity
-};
-vector<ObjectData> objects = {
-    { vec4(0.0f, 0.0f, 0.0f, SagA.r_s),
-      vec4(0.0f, 0.0f, 0.0f, 1.0f),
-      static_cast<float>(SagA.mass) }
+struct RunOptions {
+    bool gpu_validation = false;
+    bool interaction_smoke = false;
+    bool performance_smoke = false;
+    bool legacy_allocation_benchmark = false;
+    string capture_output_path;
+    int capture_frames_remaining = 0;
 };
 
-void integrateGravity(vector<ObjectData>& bodies, double timeStep) {
-    vector<dvec3> accelerations(bodies.size(), dvec3(0.0));
-    constexpr double softeningLength = 1.0e7;
-    const double softeningSquared = softeningLength * softeningLength;
-
-    // Evaluate each pair once from a single snapshot of the system.
-    for (size_t i = 0; i < bodies.size(); ++i) {
-        for (size_t j = i + 1; j < bodies.size(); ++j) {
-            dvec3 delta = dvec3(bodies[j].posRadius) - dvec3(bodies[i].posRadius);
-            double distanceSquared = dot(delta, delta) + softeningSquared;
-            double inverseDistanceCubed = 1.0 /
-                (distanceSquared * sqrt(distanceSquared));
-
-            accelerations[i] += G * static_cast<double>(bodies[j].mass)
-                              * delta * inverseDistanceCubed;
-            accelerations[j] -= G * static_cast<double>(bodies[i].mass)
-                              * delta * inverseDistanceCubed;
-        }
-    }
-
-    // main() supplies a fixed step, making gravity independent of render FPS.
-    for (size_t i = 0; i < bodies.size(); ++i) {
-        dvec3 velocity = dvec3(bodies[i].velocity)
-                       + accelerations[i] * timeStep;
-        dvec3 position = dvec3(bodies[i].posRadius)
-                       + velocity * timeStep;
-        bodies[i].velocity = vec3(velocity);
-        bodies[i].posRadius.x = static_cast<float>(position.x);
-        bodies[i].posRadius.y = static_cast<float>(position.y);
-        bodies[i].posRadius.z = static_cast<float>(position.z);
-    }
-}
+using Camera = blackhole::app::Camera;
 
 struct Engine {
-    GLuint gridShaderProgram;
+    blackhole::physics::SimulationConfiguration& simulationConfig;
+    float& diskInclinationRadians;
+    float& diskThicknessInRadii;
+    const RunOptions& runOptions;
+    GLuint gridShaderProgram = 0;
     // -- Quad & Texture render -- //
-    GLFWwindow* window;
-    GLuint quadVAO;
-    GLuint texture;
-    GLuint shaderProgram;
+    GLFWwindow* window = nullptr;
+    GLuint quadVAO = 0;
+    GLuint quadVBO = 0;
+    GLuint texture = 0;
+    GLuint shaderProgram = 0;
     GLuint computeProgram = 0;
     // -- UBOs -- //
     GLuint cameraUBO = 0;
     GLuint diskUBO = 0;
-    GLuint objectsUBO = 0;
+    GLuint integrationUBO = 0;
+    GLuint diagnosticsSSBO = 0;
+    GLuint statusPixelsSSBO = 0;
+    GLuint invariantPixelsSSBO = 0;
+    array<GLuint, 6> rayStatusCounts{};
+    int lastComputeWidth = 0;
+    int lastComputeHeight = 0;
+    int textureWidth = 0;
+    int textureHeight = 0;
+    GLsizeiptr validationPixelCapacity = 0;
+    bool uiInitialized = false;
+    bool shutdownComplete = false;
+    unsigned int glDebugErrorCount = 0;
     // -- grid mess vars -- //
     GLuint gridVAO = 0;
     GLuint gridVBO = 0;
     GLuint gridEBO = 0;
     int gridIndexCount = 0;
 
-    int WIDTH = 800;  // Window width
-    int HEIGHT = 600; // Window height
-    int COMPUTE_WIDTH  = 320;   // Stationary render resolution width
-    int COMPUTE_HEIGHT = 240;   // Stationary render resolution height
-    float width = 100000000000.0f; // Width of the viewport in meters
-    float height = 75000000000.0f; // Height of the viewport in meters
-    
-    Engine() {
+    int WIDTH = 800;          // Window width
+    int HEIGHT = 600;         // Window height
+    int COMPUTE_WIDTH = 320;  // Stationary render resolution width
+    int COMPUTE_HEIGHT = 240; // Stationary render resolution height
+
+    Engine(blackhole::physics::SimulationConfiguration& configuration,
+           float& disk_inclination_radians, float& disk_thickness_in_radii,
+           const RunOptions& options)
+        : simulationConfig(configuration), diskInclinationRadians(disk_inclination_radians),
+          diskThicknessInRadii(disk_thickness_in_radii), runOptions(options) {
         if (!glfwInit()) {
             cerr << "GLFW init failed\n";
             exit(EXIT_FAILURE);
@@ -250,15 +111,22 @@ struct Engine {
         glewExperimental = GL_TRUE;
         GLenum glewErr = glewInit();
         if (glewErr != GLEW_OK) {
-            cerr << "Failed to initialize GLEW: "
-                << (const char*)glewGetErrorString(glewErr)
-                << "\n";
+            cerr << "Failed to initialize GLEW: " << (const char*)glewGetErrorString(glewErr)
+                 << "\n";
             glfwTerminate();
             exit(EXIT_FAILURE);
         }
+        if (GLEW_VERSION_4_3 || GLEW_KHR_debug) {
+            glEnable(GL_DEBUG_OUTPUT);
+            glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+            glDebugMessageCallback(debugMessageCallback, this);
+            glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DEBUG_SEVERITY_NOTIFICATION, 0,
+                                  nullptr, GL_FALSE);
+        }
         cout << "OpenGL vendor: " << glGetString(GL_VENDOR) << "\n"
              << "OpenGL renderer: " << glGetString(GL_RENDERER) << "\n"
-             << "OpenGL version: " << glGetString(GL_VERSION) << "\n" << flush;
+             << "OpenGL version: " << glGetString(GL_VERSION) << "\n"
+             << flush;
         this->shaderProgram = CreateShaderProgram();
         gridShaderProgram = CreateShaderProgram("grid.vert", "grid.frag");
 
@@ -270,97 +138,107 @@ struct Engine {
 
         glGenBuffers(1, &diskUBO);
         glBindBuffer(GL_UNIFORM_BUFFER, diskUBO);
-        glBufferData(GL_UNIFORM_BUFFER, sizeof(float) * 8, nullptr, GL_DYNAMIC_DRAW);
+        glBufferData(GL_UNIFORM_BUFFER, sizeof(float) * 12, nullptr, GL_DYNAMIC_DRAW);
         glBindBufferBase(GL_UNIFORM_BUFFER, 2, diskUBO); // binding = 2 matches compute shader
 
-        glGenBuffers(1, &objectsUBO);
-        glBindBuffer(GL_UNIFORM_BUFFER, objectsUBO);
-        // allocate space for 16 objects: 
-        // sizeof(int) + padding + 16×(vec4 posRadius + vec4 color)
-        GLsizeiptr objUBOSize = sizeof(int) + 3 * sizeof(float)
-            + 16 * (sizeof(vec4) + sizeof(vec4) + sizeof(vec4));
-        glBufferData(GL_UNIFORM_BUFFER, objUBOSize, nullptr, GL_DYNAMIC_DRAW);
-        glBindBufferBase(GL_UNIFORM_BUFFER, 3, objectsUBO);  // binding = 3 matches shader
+        glGenBuffers(1, &integrationUBO);
+        glBindBuffer(GL_UNIFORM_BUFFER, integrationUBO);
+        glBufferData(GL_UNIFORM_BUFFER, sizeof(float) * 6 + sizeof(int) * 6, nullptr,
+                     GL_DYNAMIC_DRAW);
+        glBindBufferBase(GL_UNIFORM_BUFFER, 4, integrationUBO);
 
-        auto result = QuadVAO();
-        this->quadVAO = result[0];
-        this->texture = result[1];
+        glGenBuffers(1, &diagnosticsSSBO);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, diagnosticsSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(rayStatusCounts), nullptr, GL_DYNAMIC_READ);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, diagnosticsSSBO);
+
+        glGenBuffers(1, &statusPixelsSSBO);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, statusPixelsSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(GLuint), nullptr, GL_DYNAMIC_READ);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, statusPixelsSSBO);
+        glGenBuffers(1, &invariantPixelsSSBO);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, invariantPixelsSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float) * 8, nullptr, GL_DYNAMIC_READ);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, invariantPixelsSSBO);
+        validationPixelCapacity = 1;
+
+        createQuadResources();
     }
-    void generateGrid(const vector<ObjectData>& objects) {
-        const int gridSize = 25;
-        const float spacing = 1e10f;  // tweak this
-
+    ~Engine() { shutdown(); }
+    static void APIENTRY debugMessageCallback(GLenum, GLenum type, GLuint, GLenum severity, GLsizei,
+                                              const GLchar* message, const void* userData) {
+        auto* owner = const_cast<Engine*>(static_cast<const Engine*>(userData));
+        if (type == GL_DEBUG_TYPE_ERROR || severity == GL_DEBUG_SEVERITY_HIGH) {
+            ++owner->glDebugErrorCount;
+            cerr << "[OPENGL] " << message << '\n';
+        }
+    }
+    void generateGrid() {
+        // Flamm's paraboloid z(r) = 2 sqrt(r_s (r-r_s)) embeds one
+        // constant-time equatorial spatial slice. It is not a literal image
+        // of four-dimensional spacetime curvature.
+        constexpr int radialSegments = 28;
+        constexpr int angularSegments = 64;
+        const float schwarzschildRadius =
+            static_cast<float>(simulationConfig.black_hole.schwarzschild_radius_m);
+        const float innerRadius = 1.001f * schwarzschildRadius;
+        const float outerRadius = 14.0f * schwarzschildRadius;
         vector<vec3> vertices;
         vector<GLuint> indices;
 
-        for (int z = 0; z <= gridSize; ++z) {
-            for (int x = 0; x <= gridSize; ++x) {
-                float worldX = (x - gridSize / 2) * spacing;
-                float worldZ = (z - gridSize / 2) * spacing;
+        for (int radial = 0; radial <= radialSegments; ++radial) {
+            const float fraction = static_cast<float>(radial) / radialSegments;
+            const float radius = innerRadius + fraction * (outerRadius - innerRadius);
+            const float embeddingHeight =
+                2.0f * std::sqrt(schwarzschildRadius * (radius - schwarzschildRadius));
+            for (int angular = 0; angular <= angularSegments; ++angular) {
+                const float angle =
+                    2.0f * static_cast<float>(M_PI) * static_cast<float>(angular) / angularSegments;
+                vertices.emplace_back(radius * std::cos(angle), embeddingHeight,
+                                      radius * std::sin(angle));
+            }
+        }
 
-                float y = 0.0f;
-
-                // ✅ Warp grid using Schwarzschild geometry
-                for (const auto& obj : objects) {
-                    vec3 objPos = vec3(obj.posRadius);
-                    double mass = obj.mass;
-                    double radius = obj.posRadius.w;
-
-                    double r_s = 2.0 * G * mass / (c * c);
-                    double dx = worldX - objPos.x;
-                    double dz = worldZ - objPos.z;
-                    double dist = sqrt(dx * dx + dz * dz);
-
-                    // prevent sqrt of negative or divide-by-zero (inside or at the black hole center)
-                    if (dist > r_s) {
-                        double deltaY = 2.0 * sqrt(r_s * (dist - r_s));
-                        y += static_cast<float>(deltaY) - 3e10f;
-                    } else {
-                        // 🔴 For points inside or at r_s: make it dip down sharply
-                        y += 2.0f * static_cast<float>(sqrt(r_s * r_s)) - 3e10f;  // or add a deep pit
-                    }
+        for (int radial = 0; radial <= radialSegments; ++radial) {
+            for (int angular = 0; angular < angularSegments; ++angular) {
+                const GLuint index = static_cast<GLuint>(radial * (angularSegments + 1) + angular);
+                indices.push_back(index);
+                indices.push_back(index + 1);
+                if (radial < radialSegments) {
+                    indices.push_back(index);
+                    indices.push_back(index + angularSegments + 1);
                 }
-
-                vertices.emplace_back(worldX, y, worldZ);
             }
         }
 
-        // 🧩 Add indices for GL_LINE rendering
-        for (int z = 0; z < gridSize; ++z) {
-            for (int x = 0; x < gridSize; ++x) {
-                int i = z * (gridSize + 1) + x;
-                indices.push_back(i);
-                indices.push_back(i + 1);
-
-                indices.push_back(i);
-                indices.push_back(i + gridSize + 1);
-            }
-        }
-
-        // 🔌 Upload to GPU
-        if (gridVAO == 0) glGenVertexArrays(1, &gridVAO);
-        if (gridVBO == 0) glGenBuffers(1, &gridVBO);
-        if (gridEBO == 0) glGenBuffers(1, &gridEBO);
+        if (gridVAO == 0)
+            glGenVertexArrays(1, &gridVAO);
+        if (gridVBO == 0)
+            glGenBuffers(1, &gridVBO);
+        if (gridEBO == 0)
+            glGenBuffers(1, &gridEBO);
 
         glBindVertexArray(gridVAO);
 
         glBindBuffer(GL_ARRAY_BUFFER, gridVBO);
-        glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(vec3), vertices.data(), GL_DYNAMIC_DRAW);
+        glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(vec3), vertices.data(),
+                     GL_STATIC_DRAW);
 
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gridEBO);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(GLuint), indices.data(), GL_STATIC_DRAW);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(GLuint), indices.data(),
+                     GL_STATIC_DRAW);
 
         glEnableVertexAttribArray(0); // location = 0
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(vec3), (void*)0);
 
-        gridIndexCount = indices.size();
+        gridIndexCount = static_cast<int>(indices.size());
 
         glBindVertexArray(0);
     }
     void drawGrid(const mat4& viewProj) {
         glUseProgram(gridShaderProgram);
-        glUniformMatrix4fv(glGetUniformLocation(gridShaderProgram, "viewProj"),
-                        1, GL_FALSE, glm::value_ptr(viewProj));
+        glUniformMatrix4fv(glGetUniformLocation(gridShaderProgram, "viewProj"), 1, GL_FALSE,
+                           glm::value_ptr(viewProj));
         glBindVertexArray(gridVAO);
 
         glDisable(GL_DEPTH_TEST);
@@ -370,6 +248,7 @@ struct Engine {
         glDrawElements(GL_LINES, gridIndexCount, GL_UNSIGNED_INT, 0);
 
         glBindVertexArray(0);
+        glDisable(GL_BLEND);
         glEnable(GL_DEPTH_TEST);
     }
     void drawFullScreenQuad() {
@@ -380,11 +259,11 @@ struct Engine {
         glBindTexture(GL_TEXTURE_2D, texture);
         glUniform1i(glGetUniformLocation(shaderProgram, "screenTexture"), 0);
 
-        glDisable(GL_DEPTH_TEST);  // draw as background
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 6);  // 2 triangles
+        glDisable(GL_DEPTH_TEST); // draw as background
+        glDrawArrays(GL_TRIANGLES, 0, 6);
         glEnable(GL_DEPTH_TEST);
     }
-    GLuint CreateShaderProgram(){
+    GLuint CreateShaderProgram() {
         const char* vertexShaderSource = R"(
         #version 330 core
         layout (location = 0) in vec2 aPos;  // Changed to vec2
@@ -404,144 +283,69 @@ struct Engine {
             FragColor = texture(screenTexture, TexCoord);
         })";
 
-        // vertex shader
-        GLuint vertexShader = glCreateShader(GL_VERTEX_SHADER);
-        glShaderSource(vertexShader, 1, &vertexShaderSource, nullptr);
-        glCompileShader(vertexShader);
-
-        // fragment shader
-        GLuint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
-        glShaderSource(fragmentShader, 1, &fragmentShaderSource, nullptr);
-        glCompileShader(fragmentShader);
-
-        GLuint shaderProgram = glCreateProgram();
-        glAttachShader(shaderProgram, vertexShader);
-        glAttachShader(shaderProgram, fragmentShader);
-        glLinkProgram(shaderProgram);
-
-        glDeleteShader(vertexShader);
-        glDeleteShader(fragmentShader);
-
-        return shaderProgram;
+        return blackhole::rendering::create_program_from_sources(
+            vertexShaderSource, fragmentShaderSource, "fullscreen quad");
     };
     GLuint CreateShaderProgram(const char* vertPath, const char* fragPath) {
-        auto loadShader = [](const char* path, GLenum type) -> GLuint {
-            std::ifstream in(path);
-            if (!in.is_open()) {
-                std::cerr << "Failed to open shader: " << path << "\n";
-                exit(EXIT_FAILURE);
-            }
-            std::stringstream ss;
-            ss << in.rdbuf();
-            std::string srcStr = ss.str();
-            const char* src = srcStr.c_str();
-
-            GLuint shader = glCreateShader(type);
-            glShaderSource(shader, 1, &src, nullptr);
-            glCompileShader(shader);
-
-            GLint success;
-            glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
-            if (!success) {
-                GLint logLen;
-                glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &logLen);
-                std::vector<char> log(logLen);
-                glGetShaderInfoLog(shader, logLen, nullptr, log.data());
-                std::cerr << "Shader compile error (" << path << "):\n" << log.data() << "\n";
-                exit(EXIT_FAILURE);
-            }
-            return shader;
-        };
-
-        GLuint vertShader = loadShader(vertPath, GL_VERTEX_SHADER);
-        GLuint fragShader = loadShader(fragPath, GL_FRAGMENT_SHADER);
-
-        GLuint program = glCreateProgram();
-        glAttachShader(program, vertShader);
-        glAttachShader(program, fragShader);
-        glLinkProgram(program);
-
-        GLint linkSuccess;
-        glGetProgramiv(program, GL_LINK_STATUS, &linkSuccess);
-        if (!linkSuccess) {
-            GLint logLen;
-            glGetProgramiv(program, GL_INFO_LOG_LENGTH, &logLen);
-            std::vector<char> log(logLen);
-            glGetProgramInfoLog(program, logLen, nullptr, log.data());
-            std::cerr << "Shader link error:\n" << log.data() << "\n";
-            exit(EXIT_FAILURE);
-        }
-
-        glDeleteShader(vertShader);
-        glDeleteShader(fragShader);
-
-        return program;
+        return blackhole::rendering::create_program_from_files(vertPath, fragPath);
     }
     GLuint CreateComputeProgram(const char* path) {
-        // 1) read GLSL source
-        std::ifstream in(path);
-        if(!in.is_open()) {
-            std::cerr << "Failed to open compute shader: " << path << "\n";
-            exit(EXIT_FAILURE);
-        }
-        std::stringstream ss;
-        ss << in.rdbuf();
-        std::string srcStr = ss.str();
-        const char* src = srcStr.c_str();
-
-        // 2) compile
-        GLuint cs = glCreateShader(GL_COMPUTE_SHADER);
-        glShaderSource(cs, 1, &src, nullptr);
-        glCompileShader(cs);
-        GLint ok; 
-        glGetShaderiv(cs, GL_COMPILE_STATUS, &ok);
-        if(!ok) {
-            GLint logLen;
-            glGetShaderiv(cs, GL_INFO_LOG_LENGTH, &logLen);
-            std::vector<char> log(logLen);
-            glGetShaderInfoLog(cs, logLen, nullptr, log.data());
-            std::cerr << "Compute shader compile error:\n" << log.data() << "\n";
-            exit(EXIT_FAILURE);
-        }
-
-        // 3) link
-        GLuint prog = glCreateProgram();
-        glAttachShader(prog, cs);
-        glLinkProgram(prog);
-        glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-        if(!ok) {
-            GLint logLen;
-            glGetProgramiv(prog, GL_INFO_LOG_LENGTH, &logLen);
-            std::vector<char> log(logLen);
-            glGetProgramInfoLog(prog, logLen, nullptr, log.data());
-            std::cerr << "Compute shader link error:\n" << log.data() << "\n";
-            exit(EXIT_FAILURE);
-        }
-
-        glDeleteShader(cs);
-        return prog;
+        return blackhole::rendering::create_compute_program_from_file(path);
     }
     void dispatchCompute(const Camera& cam) {
         // determine target compute‐res
-        int cw = cam.moving ? 200 : COMPUTE_WIDTH;
-        int ch = cam.moving ? 150 : COMPUTE_HEIGHT;
+        const bool useReducedMotionResolution = simulationConfig.resolution.dynamic_resolution &&
+                                                cam.moving &&
+                                                !simulationConfig.resolution.full_resolution;
+        int cw = runOptions.gpu_validation
+                     ? 64
+                     : (simulationConfig.resolution.full_resolution
+                            ? WIDTH
+                            : (useReducedMotionResolution ? std::max(80, COMPUTE_WIDTH / 2)
+                                                          : COMPUTE_WIDTH));
+        int ch = runOptions.gpu_validation
+                     ? 48
+                     : (simulationConfig.resolution.full_resolution
+                            ? HEIGHT
+                            : (useReducedMotionResolution ? std::max(60, COMPUTE_HEIGHT / 2)
+                                                          : COMPUTE_HEIGHT));
+        lastComputeWidth = cw;
+        lastComputeHeight = ch;
 
         // 1) reallocate the texture if needed
         glBindTexture(GL_TEXTURE_2D, texture);
-        glTexImage2D(GL_TEXTURE_2D,
-                    0,                // mip
-                    GL_RGBA8,         // internal format
-                    cw,               // width
-                    ch,               // height
-                    0, GL_RGBA, 
-                    GL_UNSIGNED_BYTE, 
-                    nullptr);
+        if (cw != textureWidth || ch != textureHeight) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, cw, ch, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            textureWidth = cw;
+            textureHeight = ch;
+        }
 
         // 2) bind compute program & UBOs
         glUseProgram(computeProgram);
         uploadCameraUBO(cam);
         uploadDiskUBO();
-        uploadObjectsUBO(objects);
+        uploadIntegrationUBO();
+        const array<GLuint, 6> zeroStatusCounts{};
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, diagnosticsSSBO);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(zeroStatusCounts),
+                        zeroStatusCounts.data());
+
+        if (runOptions.gpu_validation || runOptions.legacy_allocation_benchmark) {
+            const GLsizeiptr pixelCount = static_cast<GLsizeiptr>(cw) * ch;
+            if (runOptions.legacy_allocation_benchmark || pixelCount > validationPixelCapacity) {
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, statusPixelsSSBO);
+                glBufferData(GL_SHADER_STORAGE_BUFFER, pixelCount * sizeof(GLuint), nullptr,
+                             GL_DYNAMIC_READ);
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, invariantPixelsSSBO);
+                glBufferData(GL_SHADER_STORAGE_BUFFER, pixelCount * sizeof(float) * 8, nullptr,
+                             GL_DYNAMIC_READ);
+                if (!runOptions.legacy_allocation_benchmark) {
+                    validationPixelCapacity = pixelCount;
+                }
+            }
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, statusPixelsSSBO);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, invariantPixelsSSBO);
+        }
 
         // 3) bind it as image unit 0
         glBindImageTexture(0, texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
@@ -552,14 +356,22 @@ struct Engine {
         glDispatchCompute(groupsX, groupsY, 1);
 
         // 5) sync
-        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT |
+                        GL_BUFFER_UPDATE_BARRIER_BIT);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, diagnosticsSSBO);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(rayStatusCounts),
+                           rayStatusCounts.data());
     }
     void uploadCameraUBO(const Camera& cam) {
         struct UBOData {
-            vec3 pos; float _pad0;
-            vec3 right; float _pad1;
-            vec3 up; float _pad2;
-            vec3 forward; float _pad3;
+            vec3 pos;
+            float _pad0;
+            vec3 right;
+            float _pad1;
+            vec3 up;
+            float _pad2;
+            vec3 forward;
+            float _pad3;
             float tanHalfFov;
             float aspect;
             int moving;
@@ -570,195 +382,653 @@ struct Engine {
         vec3 right = normalize(cross(fwd, up));
         up = cross(right, fwd);
 
-        data.pos = cam.position();
+        const float schwarzschildRadius =
+            static_cast<float>(simulationConfig.black_hole.schwarzschild_radius_m);
+        data.pos = cam.position() / schwarzschildRadius;
         data.right = right;
         data.up = up;
         data.forward = fwd;
-        data.tanHalfFov = tan(radians(60.0f * 0.5f));
-        data.aspect = float(WIDTH) / float(HEIGHT);
+        data.tanHalfFov =
+            tan(radians(static_cast<float>(simulationConfig.camera.vertical_fov_degrees * 0.5)));
+        data.aspect = float(lastComputeWidth) / float(lastComputeHeight);
         data.moving = (cam.dragging || cam.panning) ? 1 : 0;
 
         glBindBuffer(GL_UNIFORM_BUFFER, cameraUBO);
         glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(UBOData), &data);
     }
-    void uploadObjectsUBO(const vector<ObjectData>& objs) {
-        struct UBOData {
-            int   numObjects;
-            float _pad0, _pad1, _pad2;        // <-- pad out to 16 bytes
-            vec4  posRadius[16];
-            vec4  color[16];
-            vec4  mass[16];
-        } data{};
-
-        size_t count = std::min(objs.size(), size_t(16));
-        data.numObjects = static_cast<int>(count);
-
-        for (size_t i = 0; i < count; ++i) {
-            data.posRadius[i] = objs[i].posRadius;
-            data.color[i] = objs[i].color;
-            // std140 scalar arrays use a 16-byte stride.
-            data.mass[i] = vec4(objs[i].mass, 0.0f, 0.0f, 0.0f);
-        }
-
-        // Upload
-        glBindBuffer(GL_UNIFORM_BUFFER, objectsUBO);
-        glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(data), &data);
-    }
     void uploadDiskUBO() {
-        // disk
-        float r1 = SagA.r_s * 2.2f;    // inner radius just outside the event horizon
-        float r2 = SagA.r_s * 5.2f;   // outer radius of the disk
-        float thickness = SagA.r_s * diskThicknessInRadii;
-        float diskData[8] = {
-            r1,
-            r2,
-            diskInclinationRadians,
-            thickness,
-            static_cast<float>(fmod(glfwGetTime(), 10000.0)),
-            1.0f,  // normalized accretion rate / emissivity
-            1.0f,  // procedural detail strength
-            0.0f
-        };
+        // GPU geodesic/disk intersections are dimensionless (r_s = 1).
+        float r1 =
+            runOptions.gpu_validation
+                ? 1.0f
+                : static_cast<float>(simulationConfig.disk.inner_radius_in_schwarzschild_radii);
+        float r2 =
+            runOptions.gpu_validation
+                ? 0.0f
+                : static_cast<float>(simulationConfig.disk.outer_radius_in_schwarzschild_radii);
+        float thickness = diskThicknessInRadii;
+        constexpr double stefanBoltzmann = 5.670374419e-8;
+        const double mass = simulationConfig.black_hole.mass_kg;
+        const double radius = simulationConfig.black_hole.schwarzschild_radius_m;
+        const double fluxScale = 3.0 * blackhole::physics::gravitational_constant_si * mass *
+                                 simulationConfig.disk.accretion_rate_kg_per_s /
+                                 (8.0 * M_PI * radius * radius * radius);
+        const float temperatureScale = static_cast<float>(pow(fluxScale / stefanBoltzmann, 0.25));
+        struct DiskData {
+            float innerRadius;
+            float outerRadius;
+            float inclination;
+            float thickness;
+            float time;
+            float cinematicAccretionScale;
+            float detailStrength;
+            float pad0;
+            float temperatureScale;
+            float rotationSign;
+            int visible;
+            int pad1;
+        } diskData{r1,
+                   r2,
+                   diskInclinationRadians,
+                   thickness,
+                   static_cast<float>(fmod(glfwGetTime(), 10000.0)),
+                   1.0f,
+                   1.0f,
+                   0.0f,
+                   temperatureScale,
+                   static_cast<float>(simulationConfig.disk.rotation_sign),
+                   (!runOptions.gpu_validation && !runOptions.performance_smoke &&
+                    simulationConfig.disk.visible)
+                       ? 1
+                       : 0,
+                   0};
 
         glBindBuffer(GL_UNIFORM_BUFFER, diskUBO);
-        glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(diskData), diskData);
+        glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(diskData), &diskData);
     }
-    
-    vector<GLuint> QuadVAO(){
+    void uploadIntegrationUBO() {
+        struct UBOData {
+            float minimumStep;
+            float maximumStep;
+            float captureRadius;
+            float escapeRadius;
+            float absoluteTolerance;
+            float relativeTolerance;
+            int maximumSteps;
+            int renderMode;
+            int validationOverlay;
+            int backgroundMode;
+            int exportDiagnostics;
+            int pad2;
+        } data{};
+        data.minimumStep = static_cast<float>(simulationConfig.integration.minimum_step);
+        // The legacy benchmark retains the previous 0.05 bound. Both paths
+        // use identical error tolerances and termination rules.
+        data.maximumStep = static_cast<float>(runOptions.legacy_allocation_benchmark
+                                                  ? 0.05
+                                                  : simulationConfig.integration.maximum_step);
+        data.captureRadius = static_cast<float>(simulationConfig.integration.capture_radius);
+        data.escapeRadius = static_cast<float>(simulationConfig.integration.escape_radius);
+        data.absoluteTolerance =
+            static_cast<float>(simulationConfig.integration.absolute_tolerance);
+        data.relativeTolerance =
+            static_cast<float>(simulationConfig.integration.relative_tolerance);
+        data.maximumSteps = simulationConfig.integration.maximum_steps;
+        data.renderMode =
+            simulationConfig.render_mode == blackhole::physics::RenderMode::Physical ? 0 : 1;
+        data.validationOverlay = simulationConfig.validation_overlay ? 1 : 0;
+        data.backgroundMode = simulationConfig.background_mode;
+        data.exportDiagnostics =
+            (runOptions.gpu_validation || runOptions.legacy_allocation_benchmark) ? 1 : 0;
+
+        glBindBuffer(GL_UNIFORM_BUFFER, integrationUBO);
+        glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(data), &data);
+    }
+    void resizeFramebuffer(int widthPixels, int heightPixels) {
+        if (widthPixels <= 0 || heightPixels <= 0)
+            return;
+        WIDTH = widthPixels;
+        HEIGHT = heightPixels;
+        COMPUTE_WIDTH = std::max(160, widthPixels / 2);
+        COMPUTE_HEIGHT = std::max(90, heightPixels / 2);
+        glViewport(0, 0, WIDTH, HEIGHT);
+    }
+    void initializeUi() {
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGui::StyleColorsDark();
+        ImGui::GetIO().FontGlobalScale = 1.1f;
+        ImGui_ImplGlfw_InitForOpenGL(window, true);
+        ImGui_ImplOpenGL3_Init("#version 430");
+        uiInitialized = true;
+    }
+    void drawHud(Camera& cam, double frameMilliseconds) {
+        if (!uiInitialized || runOptions.gpu_validation)
+            return;
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        ImGui::SetNextWindowPos(ImVec2(12.0f, 12.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowBgAlpha(0.90f);
+        ImGui::Begin("Schwarzschild Scientific HUD", nullptr,
+                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse);
+        const bool physical =
+            simulationConfig.render_mode == blackhole::physics::RenderMode::Physical;
+        ImGui::Text("Mode: %s", physical ? "Physical" : "Cinematic");
+        ImGui::Text("Camera: %.4f r_s | FOV: %.1f deg",
+                    cam.radius /
+                        static_cast<float>(simulationConfig.black_hole.schwarzschild_radius_m),
+                    simulationConfig.camera.vertical_fov_degrees);
+        ImGui::Text("Disk: %.2f-%.2f r_s | inclination %.1f deg",
+                    simulationConfig.disk.inner_radius_in_schwarzschild_radii,
+                    simulationConfig.disk.outer_radius_in_schwarzschild_radii,
+                    degrees(diskInclinationRadians));
+        ImGui::Text("Tolerance: abs %.1e / rel %.1e",
+                    simulationConfig.integration.absolute_tolerance,
+                    simulationConfig.integration.relative_tolerance);
+        ImGui::Text("Resolution: %dx%d | %.2f ms | %.1f FPS", lastComputeWidth, lastComputeHeight,
+                    frameMilliseconds, frameMilliseconds > 0.0 ? 1000.0 / frameMilliseconds : 0.0);
+        ImGui::TextDisabled("Sampling: %s%s; physics tolerance unchanged",
+                            simulationConfig.resolution.full_resolution ? "full framebuffer"
+                                                                        : "half framebuffer",
+                            cam.moving && simulationConfig.resolution.dynamic_resolution &&
+                                    !simulationConfig.resolution.full_resolution
+                                ? " (halved while orbiting)"
+                                : "");
+        ImGui::TextColored(rayStatusCounts[4] || rayStatusCounts[5]
+                               ? ImVec4(1.0f, 0.35f, 0.25f, 1.0f)
+                               : ImVec4(0.35f, 1.0f, 0.45f, 1.0f),
+                           "Unresolved: %u | Invalid: %u", rayStatusCounts[4], rayStatusCounts[5]);
+        ImGui::Separator();
+        if (ImGui::Button(physical ? "Switch to Cinematic" : "Switch to Physical")) {
+            simulationConfig.render_mode = physical ? blackhole::physics::RenderMode::Cinematic
+                                                    : blackhole::physics::RenderMode::Physical;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset known view"))
+            cam.reset();
+        ImGui::Checkbox("Disk", &simulationConfig.disk.visible);
+        ImGui::SameLine();
+        ImGui::Checkbox("Flamm's paraboloid", &simulationConfig.grid_visible);
+        ImGui::Checkbox("Validation colors", &simulationConfig.validation_overlay);
+        ImGui::SameLine();
+        ImGui::Checkbox("Full-resolution still", &simulationConfig.resolution.full_resolution);
+        bool darkBackground = simulationConfig.background_mode == 1;
+        if (ImGui::Checkbox("Uniform dark background", &darkBackground)) {
+            simulationConfig.background_mode = darkBackground ? 1 : 0;
+        }
+        float inclinationDegrees = degrees(diskInclinationRadians);
+        if (ImGui::SliderFloat("Disk inclination", &inclinationDegrees, 0.0f, 85.0f, "%.1f deg")) {
+            diskInclinationRadians = radians(inclinationDegrees);
+        }
+        float fov = static_cast<float>(simulationConfig.camera.vertical_fov_degrees);
+        if (ImGui::SliderFloat("Vertical FOV", &fov, 20.0f, 100.0f, "%.1f deg")) {
+            simulationConfig.camera.vertical_fov_degrees = fov;
+        }
+        if (ImGui::Button("Reverse disk rotation")) {
+            simulationConfig.disk.rotation_sign *= -1.0;
+        }
+        ImGui::TextDisabled("Keys: M mode, D disk, B background, G grid, V validation, Home reset");
+        ImGui::End();
+
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        const string title =
+            string("Schwarzschild Black Hole - ") + (physical ? "Physical" : "Cinematic");
+        glfwSetWindowTitle(window, title.c_str());
+    }
+    void shutdownUi() {
+        if (!uiInitialized)
+            return;
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+        uiInitialized = false;
+    }
+    void shutdown() {
+        if (shutdownComplete)
+            return;
+        shutdownComplete = true;
+        if (window != nullptr) {
+            glfwMakeContextCurrent(window);
+            shutdownUi();
+            const GLuint buffers[] = {cameraUBO,       diskUBO,          integrationUBO,
+                                      diagnosticsSSBO, statusPixelsSSBO, invariantPixelsSSBO,
+                                      gridVBO,         gridEBO,          quadVBO};
+            glDeleteBuffers(static_cast<GLsizei>(std::size(buffers)), buffers);
+            const GLuint vertexArrays[] = {quadVAO, gridVAO};
+            glDeleteVertexArrays(static_cast<GLsizei>(std::size(vertexArrays)), vertexArrays);
+            glDeleteTextures(1, &texture);
+            const GLuint programs[] = {shaderProgram, gridShaderProgram, computeProgram};
+            for (GLuint program : programs) {
+                if (program != 0)
+                    glDeleteProgram(program);
+            }
+            glfwDestroyWindow(window);
+            window = nullptr;
+        }
+        glfwTerminate();
+    }
+    bool exportGpuValidation(const string& outputPath) {
+        const size_t pixelCount =
+            static_cast<size_t>(lastComputeWidth) * static_cast<size_t>(lastComputeHeight);
+        if (pixelCount == 0)
+            return false;
+        vector<GLuint> statuses(pixelCount);
+        vector<float> invariants(pixelCount * 8);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, statusPixelsSSBO);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                           static_cast<GLsizeiptr>(statuses.size() * sizeof(GLuint)),
+                           statuses.data());
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, invariantPixelsSSBO);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                           static_cast<GLsizeiptr>(invariants.size() * sizeof(float)),
+                           invariants.data());
+
+        ofstream output(outputPath, ios::trunc);
+        if (!output)
+            return false;
+        output << "x,y,status,initial_null,initial_E,initial_L2,initial_Lz,"
+                  "final_null,final_E,final_L2,final_r\n";
+        output << setprecision(9);
+        for (int y = 0; y < lastComputeHeight; ++y) {
+            for (int x = 0; x < lastComputeWidth; ++x) {
+                const size_t index = static_cast<size_t>(y) * lastComputeWidth + x;
+                output << x << ',' << y << ',' << statuses[index];
+                for (size_t component = 0; component < 8; ++component) {
+                    output << ',' << invariants[index * 8 + component];
+                }
+                output << '\n';
+            }
+        }
+        return true;
+    }
+    bool captureFramebufferBmp(const string& outputPath) {
+        if (WIDTH <= 0 || HEIGHT <= 0)
+            return false;
+        vector<unsigned char> rgb(static_cast<size_t>(WIDTH) * HEIGHT * 3);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadBuffer(GL_BACK);
+        glReadPixels(0, 0, WIDTH, HEIGHT, GL_RGB, GL_UNSIGNED_BYTE, rgb.data());
+
+        const std::uint32_t rowSize = static_cast<std::uint32_t>((WIDTH * 3 + 3) & ~3);
+        const std::uint32_t imageSize = rowSize * static_cast<std::uint32_t>(HEIGHT);
+        const std::uint32_t fileSize = 54u + imageSize;
+        array<unsigned char, 54> header{};
+        header[0] = 'B';
+        header[1] = 'M';
+        const auto write32 = [&header](size_t offset, std::uint32_t value) {
+            for (size_t byte = 0; byte < 4; ++byte) {
+                header[offset + byte] = static_cast<unsigned char>((value >> (8 * byte)) & 0xffu);
+            }
+        };
+        const auto write16 = [&header](size_t offset, std::uint16_t value) {
+            header[offset] = static_cast<unsigned char>(value & 0xffu);
+            header[offset + 1] = static_cast<unsigned char>((value >> 8) & 0xffu);
+        };
+        write32(2, fileSize);
+        write32(10, 54u);
+        write32(14, 40u);
+        write32(18, static_cast<std::uint32_t>(WIDTH));
+        write32(22, static_cast<std::uint32_t>(HEIGHT));
+        write16(26, 1u);
+        write16(28, 24u);
+        write32(34, imageSize);
+
+        ofstream output(outputPath, ios::binary | ios::trunc);
+        if (!output)
+            return false;
+        output.write(reinterpret_cast<const char*>(header.data()), header.size());
+        vector<unsigned char> row(rowSize, 0u);
+        for (int y = 0; y < HEIGHT; ++y) {
+            for (int x = 0; x < WIDTH; ++x) {
+                const size_t source = (static_cast<size_t>(y) * WIDTH + x) * 3;
+                const size_t destination = static_cast<size_t>(x) * 3;
+                row[destination] = rgb[source + 2];
+                row[destination + 1] = rgb[source + 1];
+                row[destination + 2] = rgb[source];
+            }
+            output.write(reinterpret_cast<const char*>(row.data()), row.size());
+        }
+        return output.good();
+    }
+
+    void createQuadResources() {
         float quadVertices[] = {
             // positions   // texCoords
-            -1.0f,  1.0f,  0.0f, 1.0f,  // top left
-            -1.0f, -1.0f,  0.0f, 0.0f,  // bottom left
-            1.0f, -1.0f,  1.0f, 0.0f,  // bottom right
+            -1.0f, 1.0f,  0.0f, 1.0f, // top left
+            -1.0f, -1.0f, 0.0f, 0.0f, // bottom left
+            1.0f,  -1.0f, 1.0f, 0.0f, // bottom right
 
-            -1.0f,  1.0f,  0.0f, 1.0f,  // top left
-            1.0f, -1.0f,  1.0f, 0.0f,  // bottom right
-            1.0f,  1.0f,  1.0f, 1.0f   // top right
+            -1.0f, 1.0f,  0.0f, 1.0f, // top left
+            1.0f,  -1.0f, 1.0f, 0.0f, // bottom right
+            1.0f,  1.0f,  1.0f, 1.0f  // top right
         };
-        
-        GLuint VAO, VBO;
-        glGenVertexArrays(1, &VAO);
-        glGenBuffers(1, &VBO);
 
-        glBindVertexArray(VAO);
-        glBindBuffer(GL_ARRAY_BUFFER, VBO);
+        glGenVertexArrays(1, &quadVAO);
+        glGenBuffers(1, &quadVBO);
+
+        glBindVertexArray(quadVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, quadVBO);
         glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
 
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
         glEnableVertexAttribArray(0);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
+                              (void*)(2 * sizeof(float)));
         glEnableVertexAttribArray(1);
 
-        GLuint texture;
         glGenTextures(1, &texture);
         glBindTexture(GL_TEXTURE_2D, texture);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glBindTexture(GL_TEXTURE_2D, texture);
         glTexImage2D(GL_TEXTURE_2D,
-                    0,             // mip
-                    GL_RGBA8,      // internal format
-                    COMPUTE_WIDTH,
-                    COMPUTE_HEIGHT,
-                    0,
-                    GL_RGBA,
-                    GL_UNSIGNED_BYTE,
-                    nullptr);
-        vector<GLuint> VAOtexture = {VAO, texture};
-        return VAOtexture;
+                     0,        // mip
+                     GL_RGBA8, // internal format
+                     COMPUTE_WIDTH, COMPUTE_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        textureWidth = COMPUTE_WIDTH;
+        textureHeight = COMPUTE_HEIGHT;
     }
-    void renderScene() {
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        glUseProgram(shaderProgram);
-        glBindVertexArray(quadVAO);
-        // make sure your fragment shader samples from texture unit 0:
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, texture);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-        glfwSwapBuffers(window);
-        glfwPollEvents();
-    };
 };
-Engine engine;
-void setupCameraCallbacks(GLFWwindow* window) {
-    glfwSetWindowUserPointer(window, &camera);
+struct CallbackState {
+    Camera* camera;
+    Engine* engine;
+};
+
+void setupCameraCallbacks(GLFWwindow* window, CallbackState& state) {
+    glfwSetWindowUserPointer(window, &state);
 
     glfwSetMouseButtonCallback(window, [](GLFWwindow* win, int button, int action, int mods) {
-        Camera* cam = (Camera*)glfwGetWindowUserPointer(win);
-        cam->processMouseButton(button, action, mods, win);
+        auto* callbacks = static_cast<CallbackState*>(glfwGetWindowUserPointer(win));
+        callbacks->camera->process_mouse_button(button, action, mods, win);
     });
 
     glfwSetCursorPosCallback(window, [](GLFWwindow* win, double x, double y) {
-        Camera* cam = (Camera*)glfwGetWindowUserPointer(win);
-        cam->processMouseMove(x, y);
+        auto* callbacks = static_cast<CallbackState*>(glfwGetWindowUserPointer(win));
+        callbacks->camera->process_mouse_move(x, y);
     });
 
     glfwSetScrollCallback(window, [](GLFWwindow* win, double xoffset, double yoffset) {
-        Camera* cam = (Camera*)glfwGetWindowUserPointer(win);
-        cam->processScroll(xoffset, yoffset);
+        auto* callbacks = static_cast<CallbackState*>(glfwGetWindowUserPointer(win));
+        callbacks->camera->process_scroll(xoffset, yoffset);
     });
 
     glfwSetKeyCallback(window, [](GLFWwindow* win, int key, int scancode, int action, int mods) {
-        Camera* cam = (Camera*)glfwGetWindowUserPointer(win);
-        cam->processKey(key, scancode, action, mods);
+        auto* callbacks = static_cast<CallbackState*>(glfwGetWindowUserPointer(win));
+        callbacks->camera->process_key(key, scancode, action, mods);
+    });
+    glfwSetFramebufferSizeCallback(window, [](GLFWwindow* win, int width, int height) {
+        auto* callbacks = static_cast<CallbackState*>(glfwGetWindowUserPointer(win));
+        callbacks->engine->resizeFramebuffer(width, height);
     });
 }
 
-
 // -- MAIN -- //
-int main() {
-    setupCameraCallbacks(engine.window);
-    vector<unsigned char> pixels(engine.WIDTH * engine.HEIGHT * 3);
+int main(int argc, char** argv) {
+    RunOptions runOptions;
+    bool& gpuValidationMode = runOptions.gpu_validation;
+    bool& interactionSmokeMode = runOptions.interaction_smoke;
+    bool& performanceSmokeMode = runOptions.performance_smoke;
+    bool& legacyAllocationBenchmark = runOptions.legacy_allocation_benchmark;
+    string& captureOutputPath = runOptions.capture_output_path;
+    int& captureFramesRemaining = runOptions.capture_frames_remaining;
+    auto simulationConfig = blackhole::physics::make_default_simulation_configuration();
+    float diskInclinationRadians =
+        radians(static_cast<float>(simulationConfig.disk.inclination_degrees));
+    float diskThicknessInRadii =
+        static_cast<float>(simulationConfig.disk.half_thickness_in_schwarzschild_radii);
 
-    auto t0 = Clock::now();
-    lastPrintTime = chrono::duration<double>(t0.time_since_epoch()).count();
+    for (int index = 1; index < argc; ++index) {
+        if (string(argv[index]) == "--validation-export") {
+            gpuValidationMode = true;
+        } else if (string(argv[index]) == "--capture-physical") {
+            simulationConfig.render_mode = blackhole::physics::RenderMode::Physical;
+            captureOutputPath = "physical.bmp";
+            captureFramesRemaining = 2;
+        } else if (string(argv[index]) == "--capture-cinematic") {
+            simulationConfig.render_mode = blackhole::physics::RenderMode::Cinematic;
+            captureOutputPath = "cinematic.bmp";
+            captureFramesRemaining = 2;
+        } else if (string(argv[index]) == "--capture-vacuum") {
+            simulationConfig.render_mode = blackhole::physics::RenderMode::Physical;
+            simulationConfig.disk.visible = false;
+            simulationConfig.background_mode = 1;
+            captureOutputPath = "physical_vacuum.bmp";
+            captureFramesRemaining = 2;
+        } else if (string(argv[index]) == "--capture-grid") {
+            simulationConfig.disk.visible = false;
+            simulationConfig.background_mode = 1;
+            simulationConfig.grid_visible = true;
+            captureOutputPath = "flamm_paraboloid.bmp";
+            captureFramesRemaining = 2;
+        } else if (string(argv[index]) == "--interaction-smoke") {
+            interactionSmokeMode = true;
+        } else if (string(argv[index]) == "--performance-smoke") {
+            performanceSmokeMode = true;
+        } else if (string(argv[index]) == "--legacy-allocations") {
+            legacyAllocationBenchmark = true;
+        } else if (string(argv[index]) == "--full-resolution") {
+            simulationConfig.resolution.full_resolution = true;
+        }
+    }
+    Camera camera(simulationConfig, diskInclinationRadians, diskThicknessInRadii);
+    Engine engine(simulationConfig, diskInclinationRadians, diskThicknessInRadii, runOptions);
+    CallbackState callbackState{&camera, &engine};
+    setupCameraCallbacks(engine.window, callbackState);
+    bool interactionSmokePassed = true;
+    if (interactionSmokeMode) {
+        const auto initialMode = simulationConfig.render_mode;
+        const bool initialDisk = simulationConfig.disk.visible;
+        const int initialBackground = simulationConfig.background_mode;
+        const bool initialGrid = simulationConfig.grid_visible;
+        const bool initialValidation = simulationConfig.validation_overlay;
+        const double initialRotation = simulationConfig.disk.rotation_sign;
+        const float initialInclination = diskInclinationRadians;
+        const float initialThickness = diskThicknessInRadii;
+        camera.process_key(GLFW_KEY_M, 0, GLFW_PRESS, 0);
+        camera.process_key(GLFW_KEY_D, 0, GLFW_PRESS, 0);
+        camera.process_key(GLFW_KEY_B, 0, GLFW_PRESS, 0);
+        camera.process_key(GLFW_KEY_G, 0, GLFW_PRESS, 0);
+        camera.process_key(GLFW_KEY_V, 0, GLFW_PRESS, 0);
+        camera.process_key(GLFW_KEY_R, 0, GLFW_PRESS, 0);
+        camera.process_key(GLFW_KEY_I, 0, GLFW_PRESS, 0);
+        camera.process_key(GLFW_KEY_T, 0, GLFW_PRESS, 0);
+        camera.process_scroll(0.0, 1.0e6);
+        const bool cameraLimitPassed =
+            std::abs(camera.radius - camera.min_radius) < 1.0f &&
+            camera.radius > static_cast<float>(simulationConfig.black_hole.schwarzschild_radius_m);
+        camera.process_key(GLFW_KEY_HOME, 0, GLFW_PRESS, 0);
+        interactionSmokePassed =
+            simulationConfig.render_mode != initialMode &&
+            simulationConfig.disk.visible != initialDisk &&
+            simulationConfig.background_mode != initialBackground &&
+            simulationConfig.grid_visible != initialGrid &&
+            simulationConfig.validation_overlay != initialValidation &&
+            simulationConfig.disk.rotation_sign == -initialRotation &&
+            diskInclinationRadians > initialInclination &&
+            diskThicknessInRadii > initialThickness && cameraLimitPassed &&
+            std::abs(camera.radius /
+                         static_cast<float>(simulationConfig.black_hole.schwarzschild_radius_m) -
+                     simulationConfig.camera.radius_in_schwarzschild_radii) < 1.0e-4;
+        // Restore the standard validation view before resize checks.
+        simulationConfig = blackhole::physics::make_default_simulation_configuration();
+        diskInclinationRadians =
+            radians(static_cast<float>(simulationConfig.disk.inclination_degrees));
+        diskThicknessInRadii =
+            static_cast<float>(simulationConfig.disk.half_thickness_in_schwarzschild_radii);
+        camera.reset();
+    }
+    if (!gpuValidationMode && !performanceSmokeMode)
+        engine.initializeUi();
+    if (!gpuValidationMode)
+        engine.generateGrid();
+    if (interactionSmokeMode) {
+        simulationConfig.resolution.dynamic_resolution = false;
+        camera.moving = false;
+        engine.dispatchCompute(camera);
+        const auto stationaryCounts = engine.rayStatusCounts;
+        camera.moving = true;
+        engine.dispatchCompute(camera);
+        const bool modelStable = engine.rayStatusCounts == stationaryCounts;
+        interactionSmokePassed = interactionSmokePassed && modelStable;
+        cout << "[INTERACTION] motion_model_stability=" << (modelStable ? "PASS" : "FAIL") << '\n';
+        camera.moving = false;
+        simulationConfig.resolution.dynamic_resolution = true;
+    }
+    double lastPrintTime = glfwGetTime();
+    int framesCount = 0;
 
     double lastTime = glfwGetTime();
-    double gravityAccumulator = 0.0;
-    constexpr double gravityTimeStep = 1.0 / 120.0;
-    int   renderW  = 800, renderH = 600, numSteps = 80000;
+    const array<pair<int, int>, 3> resizeSizes{{{800, 600}, {1280, 720}, {600, 900}}};
+    size_t resizeIndex = 0;
+    constexpr int performanceWarmupFrames = 5;
+    constexpr int performanceMeasuredFrames = 30;
+    int performanceFrame = 0;
+    double performanceMilliseconds = 0.0;
+    GLuint performanceQuery = 0;
+    if (performanceSmokeMode)
+        glGenQueries(1, &performanceQuery);
     while (!glfwWindowShouldClose(engine.window)) {
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);  // optional, but good practice
+        if (interactionSmokeMode && resizeIndex < resizeSizes.size()) {
+            simulationConfig.resolution.full_resolution = resizeIndex == 1;
+            glfwSetWindowSize(engine.window, resizeSizes[resizeIndex].first,
+                              resizeSizes[resizeIndex].second);
+            glfwPollEvents();
+            int framebufferWidth = 0;
+            int framebufferHeight = 0;
+            glfwGetFramebufferSize(engine.window, &framebufferWidth, &framebufferHeight);
+            engine.resizeFramebuffer(framebufferWidth, framebufferHeight);
+        }
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // optional, but good practice
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        double now   = glfwGetTime();
-        double dt    = now - lastTime;   // seconds since last frame
-        lastTime     = now;
-
-        // Decouple physics from rendering. Fixed substeps produce the same
-        // evolution at different frame rates and avoid large unstable jumps.
-        if (Gravity) {
-            gravityAccumulator += std::min(dt, 0.25);
-            while (gravityAccumulator >= gravityTimeStep) {
-                integrateGravity(objects, gravityTimeStep);
-                gravityAccumulator -= gravityTimeStep;
-            }
-        } else {
-            gravityAccumulator = 0.0;
-        }
-
-
-
-        // ---------- GRID ------------- //
-        // 2) rebuild grid mesh on CPU
-        engine.generateGrid(objects);
-        // 5) overlay the bent grid
-        mat4 view = lookAt(camera.position(), camera.target, vec3(0,1,0));
-        mat4 proj = perspective(radians(60.0f), float(engine.COMPUTE_WIDTH)/engine.COMPUTE_HEIGHT, 1e9f, 1e14f);
-        mat4 viewProj = proj * view;
-        engine.drawGrid(viewProj);
+        double now = glfwGetTime();
+        double dt = now - lastTime; // seconds since last frame
+        lastTime = now;
 
         // ---------- RUN RAYTRACER ------------- //
         glViewport(0, 0, engine.WIDTH, engine.HEIGHT);
+        if (performanceSmokeMode)
+            glBeginQuery(GL_TIME_ELAPSED, performanceQuery);
+        const auto computeStart = std::chrono::steady_clock::now();
         engine.dispatchCompute(camera);
+        if (performanceSmokeMode)
+            glEndQuery(GL_TIME_ELAPSED);
+        const auto computeEnd = std::chrono::steady_clock::now();
+        double computeMilliseconds =
+            std::chrono::duration<double, std::milli>(computeEnd - computeStart).count();
+        if (performanceSmokeMode) {
+            GLuint64 elapsedNanoseconds = 0;
+            glGetQueryObjectui64v(performanceQuery, GL_QUERY_RESULT, &elapsedNanoseconds);
+            computeMilliseconds = static_cast<double>(elapsedNanoseconds) * 1.0e-6;
+        }
+        if (gpuValidationMode) {
+            const bool exported = engine.exportGpuValidation("gpu_validation.csv");
+            cout << (exported ? "[VALIDATION] Wrote gpu_validation.csv\n"
+                              : "[VALIDATION] Failed to write gpu_validation.csv\n");
+            break;
+        }
+        if (performanceSmokeMode) {
+            engine.drawFullScreenQuad();
+            glfwSwapBuffers(engine.window);
+            glfwPollEvents();
+            if (performanceFrame >= performanceWarmupFrames) {
+                performanceMilliseconds += computeMilliseconds;
+            }
+            ++performanceFrame;
+            if (performanceFrame >= performanceWarmupFrames + performanceMeasuredFrames) {
+                const double average = performanceMilliseconds / performanceMeasuredFrames;
+                cout << "[PERFORMANCE] allocation_path="
+                     << (legacyAllocationBenchmark ? "legacy" : "optimized")
+                     << " mode=Physical-vacuum resolution=" << engine.lastComputeWidth << 'x'
+                     << engine.lastComputeHeight
+                     << " abs_tol=" << simulationConfig.integration.absolute_tolerance
+                     << " rel_tol=" << simulationConfig.integration.relative_tolerance
+                     << " average_compute_ms=" << fixed << setprecision(3) << average
+                     << " samples=" << performanceMeasuredFrames
+                     << " captured=" << engine.rayStatusCounts[0]
+                     << " escaped=" << engine.rayStatusCounts[1]
+                     << " disk=" << engine.rayStatusCounts[2]
+                     << " reserved=" << engine.rayStatusCounts[3]
+                     << " unresolved=" << engine.rayStatusCounts[4]
+                     << " invalid=" << engine.rayStatusCounts[5] << " total="
+                     << std::accumulate(engine.rayStatusCounts.begin(),
+                                        engine.rayStatusCounts.end(), 0u)
+                     << '\n';
+                break;
+            }
+            continue;
+        }
         engine.drawFullScreenQuad();
+
+        // Flamm's paraboloid is an optional embedding diagram of a
+        // constant-time equatorial spatial slice, drawn as an overlay.
+        if (simulationConfig.grid_visible) {
+            mat4 view = lookAt(camera.position(), camera.target, vec3(0, 1, 0));
+            mat4 proj = perspective(
+                radians(static_cast<float>(simulationConfig.camera.vertical_fov_degrees)),
+                float(engine.WIDTH) / engine.HEIGHT, 1e9f, 1e14f);
+            engine.drawGrid(proj * view);
+        }
+        engine.drawHud(camera, dt * 1000.0);
+        if (!captureOutputPath.empty() && --captureFramesRemaining <= 0) {
+            const bool captured = engine.captureFramebufferBmp(captureOutputPath);
+            cout << (captured ? "[CAPTURE] Wrote " : "[CAPTURE] Failed to write ")
+                 << captureOutputPath << " status_total="
+                 << std::accumulate(engine.rayStatusCounts.begin(), engine.rayStatusCounts.end(),
+                                    0u)
+                 << '\n';
+            break;
+        }
+        if (interactionSmokeMode) {
+            const double framebufferAspect = static_cast<double>(engine.WIDTH) / engine.HEIGHT;
+            const double computeAspect =
+                static_cast<double>(engine.lastComputeWidth) / engine.lastComputeHeight;
+            const bool framePassed =
+                std::abs(framebufferAspect - computeAspect) < 0.01 &&
+                (!simulationConfig.resolution.full_resolution ||
+                 (engine.lastComputeWidth == engine.WIDTH &&
+                  engine.lastComputeHeight == engine.HEIGHT)) &&
+                std::accumulate(engine.rayStatusCounts.begin(), engine.rayStatusCounts.end(), 0u) ==
+                    static_cast<unsigned int>(engine.lastComputeWidth * engine.lastComputeHeight) &&
+                engine.rayStatusCounts[4] == 0 && engine.rayStatusCounts[5] == 0;
+            interactionSmokePassed = interactionSmokePassed && framePassed;
+            cout << "[INTERACTION] " << engine.WIDTH << 'x' << engine.HEIGHT
+                 << " compute=" << engine.lastComputeWidth << 'x' << engine.lastComputeHeight
+                 << " unresolved=" << engine.rayStatusCounts[4]
+                 << " invalid=" << engine.rayStatusCounts[5] << ' '
+                 << (simulationConfig.resolution.full_resolution ? "full " : "interactive ")
+                 << (framePassed ? "PASS" : "FAIL") << '\n';
+            ++resizeIndex;
+            if (resizeIndex >= resizeSizes.size())
+                break;
+        }
+
+        ++framesCount;
+        if (now - lastPrintTime >= 1.0) {
+            cout << "[DIAGNOSTICS] fps=" << framesCount << " captured=" << engine.rayStatusCounts[0]
+                 << " escaped=" << engine.rayStatusCounts[1]
+                 << " disk=" << engine.rayStatusCounts[2]
+                 << " reserved=" << engine.rayStatusCounts[3]
+                 << " unresolved=" << engine.rayStatusCounts[4]
+                 << " invalid=" << engine.rayStatusCounts[5] << '\n';
+            framesCount = 0;
+            lastPrintTime = now;
+        }
 
         // 6) present to screen
         glfwSwapBuffers(engine.window);
         glfwPollEvents();
     }
 
-    glfwDestroyWindow(engine.window);
-    glfwTerminate();
-    return 0;
+    const unsigned int glDebugErrors = engine.glDebugErrorCount;
+    if (performanceQuery != 0)
+        glDeleteQueries(1, &performanceQuery);
+    engine.shutdown();
+    if (interactionSmokeMode) {
+        cout << "[INTERACTION] overall=" << (interactionSmokePassed ? "PASS" : "FAIL") << '\n';
+    }
+    cout << "[OPENGL] debug_errors=" << glDebugErrors << '\n';
+    return interactionSmokePassed && glDebugErrors == 0 ? 0 : 1;
 }

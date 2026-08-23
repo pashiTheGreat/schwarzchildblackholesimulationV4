@@ -22,18 +22,60 @@ layout(std140, binding = 2) uniform Disk {
     float disk_accretion_rate;
     float disk_detail_strength;
     float _disk_pad;
+    float disk_temperature_scale;
+    float disk_rotation_sign;
+    int disk_visible;
+    int _disk_pad2;
 };
 
-layout(std140, binding = 3) uniform Objects {
-    int numObjects;
-    vec4 objPosRadius[16];
-    vec4 objColor[16];
-    vec4 objMass[16];
+// All coordinates and affine steps below are dimensionless Schwarzschild
+// units: r_s = 1 and lambda_dimensionless = lambda_SI / r_s.  The C++ app
+// normalizes all distances before uploading them, so vacuum lensing contains
+// no hidden Sagittarius A* mass constant.
+layout(std140, binding = 4) uniform Integration {
+    float minimumStep;
+    float maximumStep;
+    float captureRadius;
+    float escapeRadius;
+    float absoluteTolerance;
+    float relativeTolerance;
+    int maximumSteps;
+    int renderMode;
+    int validationOverlay;
+    int backgroundMode;
+    int exportDiagnostics;
+    int _integrationPad2;
+} integration;
+
+// One atomic classification per output pixel.  Statuses are intentionally
+// distinct: numerical failures and exhausted budgets must never enlarge the
+// event-horizon silhouette.
+const int STATUS_CAPTURED = 0;
+const int STATUS_ESCAPED = 1;
+const int STATUS_DISK_HIT = 2;
+// Slot 3 remains reserved so historical six-counter reports retain their ABI.
+const int STATUS_UNRESOLVED = 4;
+const int STATUS_INVALID = 5;
+layout(std430, binding = 5) buffer RayDiagnostics {
+    uint rayStatusCounts[6];
+};
+layout(std430, binding = 6) buffer RayStatusPixels {
+    uint rayStatusPixels[];
+};
+struct ValidationInvariants {
+    vec4 initial; // null norm, E, L^2, L_z
+    vec4 final;   // null norm, E, L^2, final r
+};
+layout(std430, binding = 7) buffer RayInvariantPixels {
+    ValidationInvariants rayInvariantPixels[];
 };
 
-const float SagA_rs = 1.269e10;
-const float MIN_D_LAMBDA = 1.25e6;
-const float MAX_D_LAMBDA = 1.20e8;
+struct Ray {
+    float x, y, z, r, theta, phi;
+    float dt, dr, dtheta, dphi;
+    float E, L2, Lz;
+    bool validCoordinates;
+};
 
 // Procedural deep-space background. It is sampled with the ray's final
 // direction, after geodesic integration, so the stars bend around the hole.
@@ -185,6 +227,7 @@ vec3 diskNormal() {
 }
 
 bool intersectAccretionDisk(vec3 oldPos, vec3 newPos, out vec3 hitPosition) {
+    if (disk_visible == 0) return false;
     vec3 normal = diskNormal();
     float oldHeight = dot(oldPos, normal);
     float newHeight = dot(newPos, normal);
@@ -230,7 +273,7 @@ vec3 blackbodyColor(float temperatureKelvin) {
 
 vec3 shadeAccretionDisk(
     vec3 hitPosition,
-    vec3 rayTravelDirection,
+    Ray ray,
     float angularTravel,
     float affineDistance
 ) {
@@ -239,7 +282,6 @@ vec3 shadeAccretionDisk(
     float radius = max(length(radialVector), disk_r1);
     vec3 radialDirection = radialVector / radius;
     vec3 orbitalDirection = normalize(cross(normal, radialDirection));
-    vec3 directionToObserver = -normalize(rayTravelDirection);
 
     float radialPosition = clamp(
         (radius - disk_r1) / (disk_r2 - disk_r1), 0.0, 1.0);
@@ -254,10 +296,11 @@ vec3 shadeAccretionDisk(
     vec3 diskAxisV = normalize(cross(normal, diskAxisU));
     float azimuth = atan(dot(radialDirection, diskAxisV),
                          dot(radialDirection, diskAxisU));
-    float radiusInSchwarzschildUnits = radius / SagA_rs;
+    float radiusInSchwarzschildUnits = radius;
     float keplerianAngularSpeed = 0.72 /
         pow(max(radiusInSchwarzschildUnits, 1.0), 1.5);
-    float advectedAzimuth = azimuth - disk_time * keplerianAngularSpeed;
+    float advectedAzimuth = azimuth - disk_rotation_sign *
+        disk_time * keplerianAngularSpeed;
 
     float logarithmicRadius = log(max(radius / disk_r1, 1.0001));
     vec3 flowCoordinates = vec3(
@@ -294,20 +337,32 @@ vec3 shadeAccretionDisk(
     float normalizedFlux = clamp(thinDiskFlux / 0.05665, 0.0, 1.35);
     float temperatureFactor = pow(max(normalizedFlux, 1e-5), 0.25);
 
-    // Circular-orbit speed measured by a local stationary observer.
-    float orbitalBeta = sqrt(SagA_rs / max(2.0 * (radius - SagA_rs), SagA_rs));
-    orbitalBeta = clamp(orbitalBeta, 0.05, 0.68);
-    float gamma = inversesqrt(1.0 - orbitalBeta * orbitalBeta);
-    float lineOfSightVelocity = dot(orbitalDirection, directionToObserver);
-    float dopplerFactor = 1.0 /
-        (gamma * max(1.0 - orbitalBeta * lineOfSightVelocity, 0.15));
+    // Frequency shift from four-vectors.  With k_t=-E and a circular emitter
+    // u^mu=u^t(1,0,0,Omega), -k.u_emit=u^t(E-Omega*L_axis).
+    // The angular-momentum projection works for any disk plane because the
+    // Schwarzschild geometry is spherically symmetric.
+    float sinTheta = sin(ray.theta);
+    vec3 photonVelocity = vec3(
+        ray.dr * sinTheta * cos(ray.phi) +
+            ray.r * cos(ray.theta) * ray.dtheta * cos(ray.phi) -
+            ray.r * sinTheta * sin(ray.phi) * ray.dphi,
+        ray.dr * cos(ray.theta) - ray.r * sinTheta * ray.dtheta,
+        ray.dr * sinTheta * sin(ray.phi) +
+            ray.r * cos(ray.theta) * ray.dtheta * sin(ray.phi) +
+            ray.r * sinTheta * cos(ray.phi) * ray.dphi);
+    vec3 angularMomentum = cross(vec3(ray.x, ray.y, ray.z), photonVelocity);
+    float axisAngularMomentum = dot(angularMomentum, normal);
+    float omega = sqrt(1.0 / (2.0 * radius * radius * radius));
+    float emitterUt = inversesqrt(max(1.0 - 1.5 / radius, 1e-5));
+    float observerUt = inversesqrt(max(1.0 - 1.0 / length(cam.camPos), 1e-5));
+    float observerFrequency = ray.E * observerUt;
+    float emitterFrequency = emitterUt *
+        (ray.E - disk_rotation_sign * omega * axisAngularMomentum);
+    float observedShift = clamp(observerFrequency / max(emitterFrequency, 1e-6),
+                                0.05, 4.0);
 
-    float gravitationalRedshift = sqrt(max(1.0 - SagA_rs / radius, 0.02));
-    float observedShift = clamp(dopplerFactor * gravitationalRedshift, 0.22, 2.8);
-
-    float localTemperature = mix(2300.0, 14200.0, temperatureFactor);
-    localTemperature *= mix(0.88, 1.14,
-        clamp(surfaceDensity * 0.55, 0.0, 1.0));
+    float localTemperature = disk_temperature_scale *
+        pow(max(thinDiskFlux, 0.0), 0.25);
 
     // Keep the disk in a cinematic orange range while letting the frequency
     // shift move the approaching side toward gold and the receding side
@@ -317,28 +372,35 @@ vec3 shadeAccretionDisk(
     vec3 deepOrange = vec3(0.52, 0.022, 0.0015);
     vec3 hotOrange = vec3(1.00, 0.42, 0.035);
     vec3 approachingGold = vec3(1.00, 0.68, 0.19);
-    vec3 emissionColor = mix(deepOrange, hotOrange, pow(thermalPosition, 0.72));
+    vec3 cinematicColor = mix(deepOrange, hotOrange, pow(thermalPosition, 0.72));
 
     float blueShiftAmount = smoothstep(1.0, 1.85, observedShift);
     float redShiftAmount = smoothstep(0.0, 0.62, 1.0 - observedShift);
-    emissionColor = mix(emissionColor, approachingGold, blueShiftAmount * 0.62);
-    emissionColor = mix(emissionColor, deepOrange, redShiftAmount * 0.72);
+    cinematicColor = mix(cinematicColor, approachingGold, blueShiftAmount * 0.62);
+    cinematicColor = mix(cinematicColor, deepOrange, redShiftAmount * 0.72);
+    vec3 physicalColor = blackbodyColor(localTemperature * observedShift);
 
     // Liouville's theorem gives a fourth-power bolometric intensity shift.
     float relativisticBeaming = pow(observedShift, 4.0);
-    float higherOrderBoost = 1.0 + 0.82 * smoothstep(1.9, 5.8, angularTravel);
-    float intensity = edgeFade
-                    * normalizedFlux
-                    * surfaceDensity
-                    * relativisticBeaming
-                    * higherOrderBoost
-                    * disk_accretion_rate * 3.2;
-    return emissionColor * intensity;
+    if (integration.renderMode == 0) {
+        // Bolometric rendering: I_obs = g^4 I_emit.  normalizedFlux is a
+        // documented display exposure of the physical zero-torque flux; the
+        // procedural surface density modulates emissivity only, never rays.
+        float physicalIntensity = edgeFade * normalizedFlux * surfaceDensity *
+                                  relativisticBeaming;
+        return physicalColor * physicalIntensity;
+    }
+    float cinematicHigherOrderBoost = 1.0 +
+        0.82 * smoothstep(1.9, 5.8, angularTravel);
+    float cinematicIntensity = edgeFade * normalizedFlux * surfaceDensity *
+        relativisticBeaming * cinematicHigherOrderBoost *
+        disk_accretion_rate * 3.2;
+    return cinematicColor * cinematicIntensity;
 }
 
 vec3 photonRingEmission(float closestRadius, float angularTravel) {
     float distanceFromPhotonSphere =
-        (closestRadius - 1.5 * SagA_rs) / (0.078 * SagA_rs);
+        (closestRadius - 1.5) / 0.078;
     float criticalProximity = exp(-distanceFromPhotonSphere * distanceFromPhotonSphere);
     float windingBoost = mix(0.22, 2.65, smoothstep(1.0, 5.2, angularTravel));
     return vec3(1.0, 0.60, 0.18) * criticalProximity * windingBoost;
@@ -360,16 +422,11 @@ vec3 acesToneMap(vec3 color) {
     return clamp(color * (mappedPeak / peak), 0.0, 1.0);
 }
 
-// Globals to store hit info
-vec4 objectColor = vec4(0.0);
-vec3 hitCenter = vec3(0.0);
-float hitRadius = 0.0;
-
-struct Ray {
-    float x, y, z, r, theta, phi;
-    float dr, dtheta, dphi;
-    float E, L;
-};
+// CPU reference: physics/schwarzschild.cpp,
+// initialize_static_observer_photon().  Both implementations use the Y-up
+// convention x=r sin(theta) cos(phi), y=r cos(theta), z=r sin(theta) sin(phi)
+// and r_s-scaled geometrized units.  A ray supplied by the screen is a local
+// static-observer measurement, never a raw coordinate derivative.
 Ray initRay(vec3 pos, vec3 dir) {
     Ray ray;
     ray.x = pos.x; ray.y = pos.y; ray.z = pos.z;
@@ -378,21 +435,43 @@ Ray initRay(vec3 pos, vec3 dir) {
     ray.theta = acos(clamp(pos.y / ray.r, -1.0, 1.0));
     ray.phi = atan(pos.z, pos.x);
 
-    float dx = dir.x, dy = dir.y, dz = dir.z;
-    float sinTheta = max(sin(ray.theta), 1e-6);
-    ray.dr = sinTheta * cos(ray.phi) * dx
-           + cos(ray.theta) * dy
-           + sinTheta * sin(ray.phi) * dz;
-    ray.dtheta = (cos(ray.theta) * cos(ray.phi) * dx
-                - sinTheta * dy
-                + cos(ray.theta) * sin(ray.phi) * dz) / ray.r;
-    ray.dphi = (-sin(ray.phi) * dx + cos(ray.phi) * dz)
-             / (ray.r * sinTheta);
+    const float sinTheta = sin(ray.theta);
+    const float f = 1.0 - 1.0 / ray.r;
+    ray.validCoordinates = ray.r > 1.0 && f > 0.0 &&
+                           abs(sinTheta) >= 1e-5;
+    if (!ray.validCoordinates) {
+        ray.dt = ray.dr = ray.dtheta = ray.dphi = 0.0;
+        ray.E = ray.L2 = ray.Lz = 0.0;
+        return ray;
+    }
 
-    ray.L = ray.r * ray.r * sin(ray.theta) * ray.dphi;
-    float f = 1.0 - SagA_rs / ray.r;
-    float dt_dL = sqrt((ray.dr*ray.dr)/f + ray.r*ray.r*(ray.dtheta*ray.dtheta + sin(ray.theta)*sin(ray.theta)*ray.dphi*ray.dphi));
-    ray.E = f * dt_dL;
+    // Project the normalized screen direction into the observer's local
+    // spherical orthonormal frame (e_r, e_theta, e_phi).
+    const vec3 screenDirection = normalize(dir);
+    const vec3 eR = vec3(sinTheta * cos(ray.phi),
+                          cos(ray.theta),
+                          sinTheta * sin(ray.phi));
+    const vec3 eTheta = vec3(cos(ray.theta) * cos(ray.phi),
+                              -sinTheta,
+                              cos(ray.theta) * sin(ray.phi));
+    const vec3 ePhi = vec3(-sin(ray.phi), 0.0, cos(ray.phi));
+    const float nR = dot(screenDirection, eR);
+    const float nTheta = dot(screenDirection, eTheta);
+    const float nPhi = dot(screenDirection, ePhi);
+
+    // Static-observer tetrad initialization, with arbitrary E_local = 1:
+    // k^t=E_local/sqrt(f), k^r=E_local sqrt(f)n_r,
+    // k^theta=E_local n_theta/r, k^phi=E_local n_phi/(r sin(theta)).
+    const float localEnergy = 1.0;
+    const float sqrtF = sqrt(f);
+    ray.dt = localEnergy / sqrtF;
+    ray.dr = localEnergy * sqrtF * nR;
+    ray.dtheta = localEnergy * nTheta / ray.r;
+    ray.dphi = localEnergy * nPhi / (ray.r * sinTheta);
+    ray.E = f * ray.dt;
+    ray.L2 = ray.r * ray.r * ray.r * ray.r *
+        (ray.dtheta * ray.dtheta + sinTheta * sinTheta * ray.dphi * ray.dphi);
+    ray.Lz = ray.r * ray.r * sinTheta * sinTheta * ray.dphi;
 
     return ray;
 }
@@ -400,33 +479,18 @@ Ray initRay(vec3 pos, vec3 dir) {
 bool intercept(Ray ray, float rs) {
     return ray.r <= rs;
 }
-// Returns true on hit, captures center, radius, and base color
-bool interceptObject(Ray ray) {
-    vec3 P = vec3(ray.x, ray.y, ray.z);
-    for (int i = 0; i < numObjects; ++i) {
-        vec3 center = objPosRadius[i].xyz;
-        float radius = objPosRadius[i].w;
-        if (distance(P, center) <= radius) {
-            objectColor = objColor[i];
-            hitCenter = center;
-            hitRadius = radius;
-            return true;
-        }
-    }
-    return false;
-}
-
 void geodesicRHS(Ray ray, out vec3 d1, out vec3 d2) {
     float r = ray.r, theta = ray.theta;
     float dr = ray.dr, dtheta = ray.dtheta, dphi = ray.dphi;
     float sinTheta = max(sin(theta), 1e-6);
-    float f = max(1.0 - SagA_rs / r, 1e-6);
-    float dt_dL = ray.E / f;
-
     d1 = vec3(dr, dtheta, dphi);
-    d2.x = - (SagA_rs / (2.0 * r*r)) * f * dt_dL * dt_dL
-         + (SagA_rs / (2.0 * r*r * f)) * dr * dr
-         + r * (dtheta*dtheta + sinTheta*sinTheta*dphi*dphi);
+    // The direct coordinate equation is
+    // r''=-f(k^t)^2/(2r^2)+(k^r)^2/(2r^2f)
+    //     +r*f*((k^theta)^2+sin^2(theta)*(k^phi)^2).
+    // Substituting the null constraint and conserved total L^2 gives the
+    // algebraically identical form below.  It avoids catastrophic float
+    // cancellation between the first two terms close to the horizon.
+    d2.x = ray.L2 * (r - 1.5) / (r * r * r * r);
     d2.y = -2.0*dr*dtheta/r + sinTheta*cos(theta)*dphi*dphi;
     d2.z = -2.0*dr*dphi/r - 2.0*cos(theta)/sinTheta * dtheta * dphi;
 }
@@ -443,47 +507,144 @@ Ray offsetRay(Ray base, vec3 positionDerivative, vec3 velocityDerivative, float 
 }
 
 void rk4Step(inout Ray ray, float dL) {
+    Ray base = ray;
     vec3 k1a, k1b, k2a, k2b, k3a, k3b, k4a, k4b;
-    geodesicRHS(ray, k1a, k1b);
+    geodesicRHS(base, k1a, k1b);
 
-    Ray stage2 = offsetRay(ray, k1a, k1b, dL * 0.5);
+    Ray stage2 = offsetRay(base, k1a, k1b, dL * 0.5);
     geodesicRHS(stage2, k2a, k2b);
 
-    Ray stage3 = offsetRay(ray, k2a, k2b, dL * 0.5);
+    Ray stage3 = offsetRay(base, k2a, k2b, dL * 0.5);
     geodesicRHS(stage3, k3a, k3b);
 
-    Ray stage4 = offsetRay(ray, k3a, k3b, dL);
+    Ray stage4 = offsetRay(base, k3a, k3b, dL);
     geodesicRHS(stage4, k4a, k4b);
 
     vec3 positionDelta = (k1a + 2.0*k2a + 2.0*k3a + k4a) * (dL / 6.0);
     vec3 velocityDelta = (k1b + 2.0*k2b + 2.0*k3b + k4b) * (dL / 6.0);
 
-    ray.r      += positionDelta.x;
-    ray.theta  += positionDelta.y;
-    ray.phi    += positionDelta.z;
-    ray.dr     += velocityDelta.x;
-    ray.dtheta += velocityDelta.y;
-    ray.dphi   += velocityDelta.z;
-
-    // Convert the Y-up spherical coordinates back to Cartesian coordinates.
+    ray.r      = base.r + positionDelta.x;
+    ray.theta  = base.theta + positionDelta.y;
+    ray.phi    = base.phi + positionDelta.z;
+    ray.dr     = base.dr + velocityDelta.x;
+    ray.dtheta = base.dtheta + velocityDelta.y;
+    ray.dphi   = base.dphi + velocityDelta.z;
+    ray.dt = ray.E / max(1.0 - 1.0 / ray.r, 1e-6);
     ray.x = ray.r * sin(ray.theta) * cos(ray.phi);
     ray.y = ray.r * cos(ray.theta);
     ray.z = ray.r * sin(ray.theta) * sin(ray.phi);
 }
 
-float adaptiveStepSize(Ray ray) {
-    // Spend small, accurate steps near the horizon and quickly grow the step
-    // in weakly curved space. Camera movement uses a slightly coarser ceiling.
-    float distanceInRadii = ray.r / SagA_rs;
-    float curvatureBlend = smoothstep(1.15, 12.0, distanceInRadii);
-    float maximumStep = cam.moving != 0 ? MAX_D_LAMBDA * 1.35 : MAX_D_LAMBDA;
-    float stepSize = mix(MIN_D_LAMBDA, maximumStep, curvatureBlend);
+bool rayIsFinite(Ray ray) {
+    return !(isnan(ray.r) || isinf(ray.r) || isnan(ray.theta) ||
+             isinf(ray.theta) || isnan(ray.phi) || isinf(ray.phi) ||
+             isnan(ray.dr) || isinf(ray.dr) || isnan(ray.dtheta) ||
+             isinf(ray.dtheta) || isnan(ray.dphi) || isinf(ray.dphi));
+}
 
-    // Prevent a single inward step from jumping across the event horizon.
-    float horizonDistance = max(ray.r - SagA_rs, MIN_D_LAMBDA);
+vec4 rayInvariants(Ray ray) {
+    float f = max(1.0 - 1.0 / ray.r, 1e-8);
+    float sinTheta = sin(ray.theta);
+    float angular = ray.dtheta * ray.dtheta +
+                    sinTheta * sinTheta * ray.dphi * ray.dphi;
+    float nullValue = -f * ray.dt * ray.dt + ray.dr * ray.dr / f +
+                      ray.r * ray.r * angular;
+    float l2 = ray.r * ray.r * ray.r * ray.r * angular;
+    float lz = ray.r * ray.r * sinTheta * sinTheta * ray.dphi;
+    return vec4(nullValue, ray.E, l2, lz);
+}
+
+float componentError(float whole, float fine) {
+    float scale = integration.absoluteTolerance + integration.relativeTolerance *
+        max(abs(whole), abs(fine));
+    return abs(whole - fine) / max(scale, 1e-12);
+}
+
+float stepDoublingError(Ray whole, Ray fine) {
+    float error = 0.0;
+    error = max(error, componentError(whole.r, fine.r));
+    error = max(error, componentError(whole.theta, fine.theta));
+    error = max(error, componentError(whole.phi, fine.phi));
+    error = max(error, componentError(whole.dr, fine.dr));
+    error = max(error, componentError(whole.dtheta, fine.dtheta));
+    error = max(error, componentError(whole.dphi, fine.dphi));
+    return error / 15.0;
+}
+
+// Returns false only when the ray cannot meet configured error bounds.  The
+// accepted fine state is retained; RK4 step-doubling is robust on GPU drivers
+// without an embedded RK pair.
+bool adaptiveRK4Step(inout Ray ray, inout float suggestedStep,
+                     out float acceptedStep) {
+    float step = suggestedStep;
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        Ray whole = ray;
+        rk4Step(whole, step);
+        Ray fine = ray;
+        rk4Step(fine, step * 0.5);
+        rk4Step(fine, step * 0.5);
+        if (!rayIsFinite(whole) || !rayIsFinite(fine)) {
+            step *= 0.25;
+        } else if (fine.r <= integration.captureRadius) {
+            // The horizon event is bracketed by the previous and fine states;
+            // main() interpolates that crossing before classifying capture.
+            ray = fine;
+            acceptedStep = step;
+            return true;
+        } else {
+            float error = stepDoublingError(whole, fine);
+            if (error <= 1.0) {
+                ray = fine;
+                acceptedStep = step;
+                float growth = error <= 1e-8 ? 2.0 :
+                    clamp(0.9 * pow(1.0 / error, 0.2), 0.2, 2.0);
+                suggestedStep = clamp(step * growth, integration.minimumStep,
+                                      integration.maximumStep);
+                return true;
+            }
+            step *= clamp(0.9 * pow(1.0 / error, 0.2), 0.1, 0.5);
+        }
+        if (step < integration.minimumStep) {
+            return false;
+        }
+    }
+    return false;
+}
+
+bool interpolateHorizonCrossing(Ray previous, Ray current, float radius,
+                                out Ray crossing) {
+    if (!(previous.r > radius && current.r <= radius)) return false;
+    float fraction = clamp((previous.r - radius) /
+                           max(previous.r - current.r, 1e-8), 0.0, 1.0);
+    crossing = previous;
+    crossing.r = mix(previous.r, current.r, fraction);
+    crossing.theta = mix(previous.theta, current.theta, fraction);
+    crossing.phi = mix(previous.phi, current.phi, fraction);
+    crossing.dr = mix(previous.dr, current.dr, fraction);
+    crossing.dtheta = mix(previous.dtheta, current.dtheta, fraction);
+    crossing.dphi = mix(previous.dphi, current.dphi, fraction);
+    crossing.dt = mix(previous.dt, current.dt, fraction);
+    crossing.x = crossing.r * sin(crossing.theta) * cos(crossing.phi);
+    crossing.y = crossing.r * cos(crossing.theta);
+    crossing.z = crossing.r * sin(crossing.theta) * sin(crossing.phi);
+    return true;
+}
+
+float adaptiveStepSize(Ray ray) {
+    // Geometry supplies only a safe upper bound; step-doubling supplies the
+    // actual local-error control.  A quadratic curvature scale avoids the old
+    // radius interpolation that forced thousands of minimum-size steps.
+    float curvatureStep = clamp(0.02 * ray.r * ray.r,
+                                integration.minimumStep,
+                                integration.maximumStep);
+    // Prevent a single inward step from jumping far beyond the configured
+    // capture event surface.
+    float horizonDistance = max(ray.r - integration.captureRadius,
+                                integration.minimumStep);
     float inwardSpeed = max(abs(ray.dr), 0.25);
-    float horizonSafeStep = horizonDistance * 0.20 / inwardSpeed;
-    return clamp(min(stepSize, horizonSafeStep), MIN_D_LAMBDA, maximumStep);
+    float horizonSafeStep = horizonDistance * 0.25 / inwardSpeed;
+    return clamp(min(curvatureStep, horizonSafeStep), integration.minimumStep,
+                 integration.maximumStep);
 }
 void main() {
     ivec2 imageDimensions = imageSize(outImage);
@@ -492,12 +653,28 @@ void main() {
 
     ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
     if (pix.x >= WIDTH || pix.y >= HEIGHT) return;
+    int pixelIndex = pix.y * WIDTH + pix.x;
 
     // Init Ray
     float u = (2.0 * (pix.x + 0.5) / WIDTH - 1.0) * cam.aspect * cam.tanHalfFov;
     float v = (1.0 - 2.0 * (pix.y + 0.5) / HEIGHT) * cam.tanHalfFov;
     vec3 dir = normalize(u * cam.camRight - v * cam.camUp + cam.camForward);
     Ray ray = initRay(cam.camPos, dir);
+    if (integration.exportDiagnostics != 0) {
+        rayInvariantPixels[pixelIndex].initial = rayInvariants(ray);
+    }
+    if (!ray.validCoordinates) {
+        // Camera controls normally prevent this path.  Make any future
+        // coordinate-chart violation explicit instead of manufacturing a
+        // capture/shadow pixel.
+        atomicAdd(rayStatusCounts[STATUS_INVALID], 1u);
+        if (integration.exportDiagnostics != 0) {
+            rayStatusPixels[pixelIndex] = uint(STATUS_INVALID);
+            rayInvariantPixels[pixelIndex].final = vec4(0.0);
+        }
+        imageStore(outImage, pix, vec4(1.0, 0.0, 1.0, 1.0));
+        return;
+    }
 
     vec4 color = vec4(0.0);
     vec3 prevPos = vec3(ray.x, ray.y, ray.z);
@@ -507,30 +684,42 @@ void main() {
     float closestRadius = ray.r;
     float angularTravel = 0.0;
 
-    bool hitBlackHole = false;
-    bool hitDisk      = false;
-    bool hitObject    = false;
-    bool escaped      = false;
+    int status = STATUS_UNRESOLVED;
+    float suggestedStep = adaptiveStepSize(ray);
 
     // Keep the same integration budget while moving. Most rays terminate
     // early, while near-critical rays no longer change classification merely
     // because the camera is being dragged.
-    int maxSteps = 24000;
-    float escapeRadius = max(length(cam.camPos) * 2.5, disk_r2 * 8.0);
-    float captureRadius = SagA_rs * 1.0005;
+    int maxSteps = integration.maximumSteps;
+    float escapeRadius = max(integration.escapeRadius, max(length(cam.camPos) * 2.5, disk_r2 * 8.0));
+    float captureRadius = integration.captureRadius;
 
     for (int i = 0; i < maxSteps; ++i) {
-        if (intercept(ray, captureRadius)) { hitBlackHole = true; break; }
-        float stepSize = adaptiveStepSize(ray);
-        rk4Step(ray, stepSize);
+        if (intercept(ray, captureRadius)) {
+            status = STATUS_CAPTURED;
+            break;
+        }
+        Ray previousRay = ray;
+        float stepSize = min(suggestedStep, adaptiveStepSize(ray));
+        float acceptedStep = 0.0;
+        suggestedStep = stepSize;
+        if (!adaptiveRK4Step(ray, suggestedStep, acceptedStep)) {
+            status = STATUS_UNRESOLVED;
+            break;
+        }
+        stepSize = acceptedStep;
         lambda += stepSize;
 
-        // Invalid near-horizon states must never fall through to the
-        // background sampler as apparent light inside the shadow.
-        if (isnan(ray.r) || isinf(ray.r)) break;
+        if (!rayIsFinite(ray)) {
+            status = STATUS_INVALID;
+            break;
+        }
 
         vec3 newPos = vec3(ray.x, ray.y, ray.z);
-        if (any(isnan(newPos)) || any(isinf(newPos))) break;
+        if (any(isnan(newPos)) || any(isinf(newPos))) {
+            status = STATUS_INVALID;
+            break;
+        }
         vec3 travel = newPos - prevPos;
         if (dot(travel, travel) > 0.0) finalRayDirection = normalize(travel);
 
@@ -542,51 +731,69 @@ void main() {
         closestRadius = min(closestRadius, ray.r);
 
         if (intersectAccretionDisk(prevPos, newPos, diskHitPosition)) {
-            hitDisk = true;
+            status = STATUS_DISK_HIT;
             break;
         }
-        if (intercept(ray, captureRadius)) { hitBlackHole = true; break; }
-        if (interceptObject(ray)) { hitObject = true; break; }
+        Ray horizonCrossing;
+        bool crossedHorizon = interpolateHorizonCrossing(
+            previousRay, ray, captureRadius, horizonCrossing);
+        if (crossedHorizon || intercept(ray, captureRadius)) {
+            if (crossedHorizon) ray = horizonCrossing;
+            status = STATUS_CAPTURED;
+            break;
+        }
         prevPos = newPos;
         if (ray.r >= escapeRadius && ray.dr > 0.0) {
-            escaped = true;
+            status = STATUS_ESCAPED;
             break;
         }
     }
 
-    if (hitDisk) {
+    atomicAdd(rayStatusCounts[status], 1u);
+    if (integration.exportDiagnostics != 0) {
+        rayStatusPixels[pixelIndex] = uint(status);
+        if (rayIsFinite(ray)) {
+            rayInvariantPixels[pixelIndex].final = rayInvariants(ray);
+            rayInvariantPixels[pixelIndex].final.w = ray.r;
+        } else {
+            rayInvariantPixels[pixelIndex].final = vec4(0.0);
+        }
+    }
+    if (status == STATUS_DISK_HIT) {
         vec3 diskColor = shadeAccretionDisk(
-            diskHitPosition, finalRayDirection, angularTravel, lambda);
+            diskHitPosition, ray, angularTravel, lambda);
         color = vec4(diskColor, 1.0);
 
-    } else if (hitBlackHole) {
+    } else if (status == STATUS_CAPTURED) {
         color = vec4(0.0, 0.0, 0.0, 1.0);
 
-    } else if (hitObject) {
-        // Compute shading
-        vec3 P = vec3(ray.x, ray.y, ray.z);
-        vec3 N = normalize(P - hitCenter);
-        vec3 V = normalize(cam.camPos - P);
-        float ambient = 0.1;
-        float diff = max(dot(N, V), 0.0);
-        float intensity = ambient + (1.0 - ambient) * diff;
-        vec3 shaded = objectColor.rgb * intensity;
-        color = vec4(shaded, objectColor.a);
-
-    } else if (escaped) {
-        color = vec4(spaceBackground(finalRayDirection), 1.0);
+    } else if (status == STATUS_ESCAPED) {
+        color = integration.backgroundMode == 0
+            ? vec4(spaceBackground(finalRayDirection), 1.0)
+            : vec4(0.001, 0.001, 0.0015, 1.0);
 
     } else {
-        // Rays that use the complete integration budget without escaping are
-        // unresolved near-critical/captured rays, not background light.
-        color = vec4(0.0, 0.0, 0.0, 1.0);
+        // Numerical failure is never a shadow pixel.  Debug/validation builds
+        // show an unmistakable color; release Physical mode uses a dark-blue
+        // fallback that remains visibly distinct from capture.
+        bool invalid = status == STATUS_INVALID;
+        if (integration.validationOverlay != 0) {
+            color = invalid ? vec4(1.0, 0.0, 1.0, 1.0)
+                            : vec4(1.0, 1.0, 0.0, 1.0);
+        } else {
+            color = invalid ? vec4(0.25, 0.0, 0.25, 1.0)
+                            : vec4(0.0, 0.03, 0.14, 1.0);
+        }
     }
 
-    if (escaped || hitDisk) {
+    if (integration.renderMode != 0 &&
+        (status == STATUS_ESCAPED || status == STATUS_DISK_HIT)) {
         color.rgb += photonRingEmission(closestRadius, angularTravel);
     }
 
-    color.rgb = acesToneMap(color.rgb);
+    color.rgb = integration.renderMode == 0
+        ? color.rgb / (vec3(1.0) + color.rgb)
+        : acesToneMap(color.rgb);
 
     imageStore(outImage, pix, color);
 }

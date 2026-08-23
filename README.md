@@ -10,7 +10,8 @@ a procedurally generated deep-space background.
 - GPU ray tracing with an OpenGL 4.3 compute shader
 - Schwarzschild gravitational lensing
 - Procedural stars, galactic clouds, and nebula-like background detail
-- Emissive, turbulent accretion disk
+- Relativistic accretion disk with Doppler beaming and gravitational redshift
+- Photon-ring and higher-order disk-image enhancement
 - Interactive orbit camera and zoom
 - Optional gravitational motion for scene objects
 - NVIDIA Optimus and AMD high-performance GPU hints on Windows
@@ -119,6 +120,8 @@ drivers on some systems.
 | Mouse wheel | Zoom in or out |
 | Hold right mouse button | Enable object gravity while held |
 | `G` | Toggle object gravity on or off |
+| `I` / `Shift+I` | Increase/decrease disk inclination |
+| `T` / `Shift+T` | Increase/decrease disk thickness |
 | Window close button | Exit the simulation |
 
 ## Verify which GPU is being used

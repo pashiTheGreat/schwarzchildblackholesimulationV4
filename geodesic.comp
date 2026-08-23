@@ -9,27 +9,31 @@ layout(std140, binding = 1) uniform Camera {
     vec3 camForward; float _pad3;
     float tanHalfFov;
     float aspect;
-    bool moving;
+    int moving;
     int   _pad4;
 } cam;
 
 layout(std140, binding = 2) uniform Disk {
     float disk_r1;
     float disk_r2;
-    float disk_num;
+    float disk_inclination;
     float thickness;
+    float disk_time;
+    float disk_accretion_rate;
+    float disk_detail_strength;
+    float _disk_pad;
 };
 
 layout(std140, binding = 3) uniform Objects {
     int numObjects;
     vec4 objPosRadius[16];
     vec4 objColor[16];
-    float  mass[16]; 
+    vec4 objMass[16];
 };
 
 const float SagA_rs = 1.269e10;
-const float D_LAMBDA = 1e7;
-const double ESCAPE_R = 1e30;
+const float MIN_D_LAMBDA = 1.25e6;
+const float MAX_D_LAMBDA = 1.20e8;
 
 // Procedural deep-space background. It is sampled with the ray's final
 // direction, after geodesic integration, so the stars bend around the hole.
@@ -79,6 +83,18 @@ float fbm(vec3 p) {
     return value;
 }
 
+float ridgedFbm(vec3 p) {
+    float value = 0.0;
+    float amplitude = 0.55;
+    for (int octave = 0; octave < 5; ++octave) {
+        float ridge = 1.0 - abs(2.0 * valueNoise(p) - 1.0);
+        value += ridge * ridge * amplitude;
+        p = p * 2.11 + vec3(5.7, 17.3, 11.9);
+        amplitude *= 0.48;
+    }
+    return value;
+}
+
 vec3 starLayer(vec2 uv, float scale, float density) {
     vec2 grid = uv * scale;
     vec2 cell = floor(grid);
@@ -87,11 +103,18 @@ vec3 starLayer(vec2 uv, float scale, float density) {
     vec3 randomValues = hash33(seed);
 
     vec2 starOffset = (randomValues.xy - 0.5) * 0.72;
-    float distanceToStar = length(local - starOffset);
+    vec2 starLocal = local - starOffset;
+    float distanceToStar = length(starLocal);
     float exists = step(density, randomValues.z);
     float radius = mix(0.055, 0.16, hash31(seed + 8.0));
     float core = 1.0 - smoothstep(radius * 0.18, radius, distanceToStar);
-    float glow = exp(-distanceToStar * 24.0) * 0.28;
+    float glow = exp(-distanceToStar * 22.0) * 0.24;
+
+    float rareBrightStar = step(0.965, hash31(seed + 67.0));
+    float horizontalRay = exp(-abs(starLocal.x) * 85.0);
+    float verticalRay = exp(-abs(starLocal.y) * 85.0);
+    float diffraction = (horizontalRay + verticalRay)
+                      * exp(-distanceToStar * 9.0) * rareBrightStar * 0.32;
 
     float temperature = hash31(seed + 21.0);
     vec3 warm = vec3(1.0, 0.62, 0.32);
@@ -100,8 +123,8 @@ vec3 starLayer(vec2 uv, float scale, float density) {
     vec3 starColor = temperature < 0.32
         ? mix(warm, neutral, temperature / 0.32)
         : mix(neutral, blue, (temperature - 0.32) / 0.68);
-    float brightness = mix(0.7, 2.8, hash31(seed + 41.0));
-    return starColor * exists * (core + glow) * brightness;
+    float brightness = mix(0.55, 3.2, hash31(seed + 41.0));
+    return starColor * exists * (core + glow + diffraction) * brightness;
 }
 
 vec3 spaceBackground(vec3 direction) {
@@ -111,21 +134,230 @@ vec3 spaceBackground(vec3 direction) {
                       asin(clamp(d.y, -1.0, 1.0)) / PI + 0.5);
 
     vec3 galaxyNormal = normalize(vec3(0.23, 0.91, -0.34));
-    float latitude = abs(dot(d, galaxyNormal));
-    float broadBand = exp(-latitude * 7.0);
-    float brightCore = exp(-latitude * 24.0);
-    float clouds = fbm(d * 5.0 + vec3(2.0, 8.0, 1.0));
-    float wisps = fbm(d * 13.0 - vec3(7.0, 3.0, 9.0));
+    float largeClouds = fbm(d * 4.2 + vec3(2.0, 8.0, 1.0));
+    float warpedLatitude = dot(d, galaxyNormal)
+                         + (largeClouds - 0.5) * 0.105;
+    float latitude = abs(warpedLatitude);
+    float broadBand = exp(-latitude * 4.8);
+    float denseBand = exp(-latitude * 15.5);
 
-    vec3 color = vec3(0.0025, 0.004, 0.014);
-    color += vec3(0.025, 0.035, 0.085) * broadBand * (0.35 + clouds);
-    color += vec3(0.12, 0.045, 0.16) * brightCore * pow(clouds, 2.0);
-    color += vec3(0.08, 0.11, 0.16) * brightCore * pow(wisps, 3.0);
+    float cloudDetail = fbm(d * 10.0 - vec3(7.0, 3.0, 9.0));
+    float filamentDetail = ridgedFbm(d * 15.0 + vec3(4.0, 12.0, 6.0));
+    float dustNoise = fbm(d * 24.0 - vec3(13.0, 2.0, 17.0));
+    float dustLane = denseBand * smoothstep(0.48, 0.77, dustNoise)
+                   * (0.45 + 0.55 * filamentDetail);
 
-    color += starLayer(skyUv, 95.0, 0.82);
-    color += starLayer(skyUv + vec2(0.173, 0.291), 190.0, 0.91);
-    color += starLayer(skyUv + vec2(0.417, 0.113), 360.0, 0.965);
+    vec3 approximateCore = vec3(-0.72, 0.08, 0.69);
+    vec3 coreDirection = normalize(
+        approximateCore - galaxyNormal * dot(approximateCore, galaxyNormal));
+    float coreAlignment = pow(max(dot(d, coreDirection), 0.0), 7.0);
+    float warmCore = denseBand * coreAlignment
+                   * (0.45 + 0.85 * filamentDetail);
+
+    vec3 color = vec3(0.0012, 0.0022, 0.012);
+    color += vec3(0.004, 0.008, 0.026) * (0.5 + 0.5 * d.y);
+    color += vec3(0.018, 0.030, 0.105) * broadBand
+           * (0.32 + 0.88 * largeClouds);
+    color += vec3(0.075, 0.055, 0.19) * denseBand
+           * (0.25 + 0.75 * cloudDetail);
+    color += vec3(0.10, 0.11, 0.24) * denseBand
+           * pow(clamp(filamentDetail, 0.0, 1.4), 2.0);
+    color += vec3(0.34, 0.14, 0.105) * warmCore;
+
+    // Dark molecular clouds break up the galactic band like the reference.
+    color *= 1.0 - clamp(dustLane * 0.72, 0.0, 0.78);
+
+    vec3 stars = vec3(0.0);
+    stars += starLayer(skyUv, 82.0, 0.84);
+    stars += starLayer(skyUv + vec2(0.173, 0.291), 175.0, 0.91);
+    stars += starLayer(skyUv + vec2(0.417, 0.113), 330.0, 0.963);
+    float galacticStarDensity = mix(0.989, 0.945,
+        clamp(denseBand * (0.35 + largeClouds), 0.0, 1.0));
+    stars += starLayer(skyUv + vec2(0.713, 0.537), 540.0, galacticStarDensity);
+    color += stars * (1.0 - clamp(dustLane * 0.58, 0.0, 0.7));
     return color;
+}
+
+vec3 diskNormal() {
+    // Tilt the original Y-up disk around the Z axis. This keeps the default
+    // camera outside the finite disk slab instead of embedded inside it.
+    return normalize(vec3(sin(disk_inclination), cos(disk_inclination), 0.0));
+}
+
+bool intersectAccretionDisk(vec3 oldPos, vec3 newPos, out vec3 hitPosition) {
+    vec3 normal = diskNormal();
+    float oldHeight = dot(oldPos, normal);
+    float newHeight = dot(newPos, normal);
+    float halfThickness = max(thickness, 1.0);
+
+    bool enteredSlab = abs(newHeight) <= halfThickness;
+    bool crossedMidplane = oldHeight * newHeight <= 0.0;
+    if (!enteredSlab && !crossedMidplane) return false;
+
+    float interpolation = 1.0;
+    float heightDelta = oldHeight - newHeight;
+    if (abs(heightDelta) > 1e-5) {
+        if (abs(oldHeight) > halfThickness && enteredSlab) {
+            float boundary = sign(oldHeight) * halfThickness;
+            interpolation = (oldHeight - boundary) / heightDelta;
+        } else if (crossedMidplane) {
+            interpolation = oldHeight / heightDelta;
+        }
+    }
+
+    hitPosition = mix(oldPos, newPos, clamp(interpolation, 0.0, 1.0));
+    vec3 radialVector = hitPosition - normal * dot(hitPosition, normal);
+    float diskRadius = length(radialVector);
+    return diskRadius >= disk_r1 && diskRadius <= disk_r2;
+}
+
+vec3 blackbodyColor(float temperatureKelvin) {
+    // Fast approximation of a blackbody radiator in display RGB.
+    float temperature = clamp(temperatureKelvin, 1000.0, 40000.0) / 100.0;
+    float red = temperature <= 66.0
+        ? 1.0
+        : clamp(1.292936 * pow(temperature - 60.0, -0.133205), 0.0, 1.0);
+    float green = temperature <= 66.0
+        ? clamp(0.390082 * log(temperature) - 0.631841, 0.0, 1.0)
+        : clamp(1.129891 * pow(temperature - 60.0, -0.075515), 0.0, 1.0);
+    float blue = temperature >= 66.0
+        ? 1.0
+        : (temperature <= 19.0
+            ? 0.0
+            : clamp(0.543207 * log(temperature - 10.0) - 1.196254, 0.0, 1.0));
+    return vec3(red, green, blue);
+}
+
+vec3 shadeAccretionDisk(
+    vec3 hitPosition,
+    vec3 rayTravelDirection,
+    float angularTravel,
+    float affineDistance
+) {
+    vec3 normal = diskNormal();
+    vec3 radialVector = hitPosition - normal * dot(hitPosition, normal);
+    float radius = max(length(radialVector), disk_r1);
+    vec3 radialDirection = radialVector / radius;
+    vec3 orbitalDirection = normalize(cross(normal, radialDirection));
+    vec3 directionToObserver = -normalize(rayTravelDirection);
+
+    float radialPosition = clamp(
+        (radius - disk_r1) / (disk_r2 - disk_r1), 0.0, 1.0);
+    float edgeFade = smoothstep(0.0, 0.06, radialPosition)
+                   * (1.0 - smoothstep(0.82, 1.0, radialPosition));
+
+    // Build stable coordinates in the inclined disk plane. Texture features
+    // are advected at a radius-dependent Keplerian angular speed, producing
+    // differential rotation and natural spiral shear rather than sliding the
+    // entire texture as one rigid surface.
+    vec3 diskAxisU = normalize(cross(normal, vec3(0.0, 0.0, 1.0)));
+    vec3 diskAxisV = normalize(cross(normal, diskAxisU));
+    float azimuth = atan(dot(radialDirection, diskAxisV),
+                         dot(radialDirection, diskAxisU));
+    float radiusInSchwarzschildUnits = radius / SagA_rs;
+    float keplerianAngularSpeed = 0.72 /
+        pow(max(radiusInSchwarzschildUnits, 1.0), 1.5);
+    float advectedAzimuth = azimuth - disk_time * keplerianAngularSpeed;
+
+    float logarithmicRadius = log(max(radius / disk_r1, 1.0001));
+    vec3 flowCoordinates = vec3(
+        cos(advectedAzimuth) * radiusInSchwarzschildUnits,
+        sin(advectedAzimuth) * radiusInSchwarzschildUnits,
+        logarithmicRadius * 4.0);
+    float broadTurbulence = fbm(flowCoordinates * 2.8 + vec3(2.0, 9.0, 4.0));
+    float fineFilaments = ridgedFbm(
+        flowCoordinates * 7.5 + vec3(13.0, 3.0, disk_time * 0.025));
+    float spiralPhase = advectedAzimuth * 7.0 - logarithmicRadius * 19.0;
+    float spiralArm = pow(0.5 + 0.5 * sin(spiralPhase), 4.0);
+    float fineRings = pow(0.5 + 0.5 * sin(
+        radiusInSchwarzschildUnits * 54.0
+        + broadTurbulence * 7.0 - advectedAzimuth * 2.0), 7.0);
+    float darkClumps = smoothstep(0.58, 0.82, valueNoise(
+        flowCoordinates * 11.0 - vec3(4.0, disk_time * 0.018, 7.0)));
+
+    float surfaceDensity = 0.48
+        + 0.48 * broadTurbulence
+        + 0.58 * fineFilaments
+        + 0.48 * spiralArm
+        + 0.34 * fineRings;
+    surfaceDensity *= 1.0 - 0.58 * darkClumps;
+    surfaceDensity = mix(1.0, surfaceDensity, disk_detail_strength);
+    surfaceDensity = clamp(surfaceDensity, 0.18, 2.35);
+
+    // Newtonian limit of the zero-torque thin-disk flux profile:
+    // F(r) proportional to r^-3 * (1 - sqrt(r_in/r)). Its fourth root gives
+    // the effective temperature. This peaks just outside the inner edge.
+    float normalizedRadius = max(radius / disk_r1, 1.0001);
+    float noTorqueBoundary = max(1.0 - inversesqrt(normalizedRadius), 0.0);
+    float thinDiskFlux = noTorqueBoundary /
+        (normalizedRadius * normalizedRadius * normalizedRadius);
+    float normalizedFlux = clamp(thinDiskFlux / 0.05665, 0.0, 1.35);
+    float temperatureFactor = pow(max(normalizedFlux, 1e-5), 0.25);
+
+    // Circular-orbit speed measured by a local stationary observer.
+    float orbitalBeta = sqrt(SagA_rs / max(2.0 * (radius - SagA_rs), SagA_rs));
+    orbitalBeta = clamp(orbitalBeta, 0.05, 0.68);
+    float gamma = inversesqrt(1.0 - orbitalBeta * orbitalBeta);
+    float lineOfSightVelocity = dot(orbitalDirection, directionToObserver);
+    float dopplerFactor = 1.0 /
+        (gamma * max(1.0 - orbitalBeta * lineOfSightVelocity, 0.15));
+
+    float gravitationalRedshift = sqrt(max(1.0 - SagA_rs / radius, 0.02));
+    float observedShift = clamp(dopplerFactor * gravitationalRedshift, 0.22, 2.8);
+
+    float localTemperature = mix(2300.0, 14200.0, temperatureFactor);
+    localTemperature *= mix(0.88, 1.14,
+        clamp(surfaceDensity * 0.55, 0.0, 1.0));
+
+    // Keep the disk in a cinematic orange range while letting the frequency
+    // shift move the approaching side toward gold and the receding side
+    // toward deep red-orange. Relativistic intensity is applied below.
+    float thermalPosition = clamp(
+        (localTemperature - 2300.0) / (14200.0 - 2300.0), 0.0, 1.0);
+    vec3 deepOrange = vec3(0.52, 0.022, 0.0015);
+    vec3 hotOrange = vec3(1.00, 0.42, 0.035);
+    vec3 approachingGold = vec3(1.00, 0.68, 0.19);
+    vec3 emissionColor = mix(deepOrange, hotOrange, pow(thermalPosition, 0.72));
+
+    float blueShiftAmount = smoothstep(1.0, 1.85, observedShift);
+    float redShiftAmount = smoothstep(0.0, 0.62, 1.0 - observedShift);
+    emissionColor = mix(emissionColor, approachingGold, blueShiftAmount * 0.62);
+    emissionColor = mix(emissionColor, deepOrange, redShiftAmount * 0.72);
+
+    // Liouville's theorem gives a fourth-power bolometric intensity shift.
+    float relativisticBeaming = pow(observedShift, 4.0);
+    float higherOrderBoost = 1.0 + 0.82 * smoothstep(1.9, 5.8, angularTravel);
+    float intensity = edgeFade
+                    * normalizedFlux
+                    * surfaceDensity
+                    * relativisticBeaming
+                    * higherOrderBoost
+                    * disk_accretion_rate * 3.2;
+    return emissionColor * intensity;
+}
+
+vec3 photonRingEmission(float closestRadius, float angularTravel) {
+    float distanceFromPhotonSphere =
+        (closestRadius - 1.5 * SagA_rs) / (0.078 * SagA_rs);
+    float criticalProximity = exp(-distanceFromPhotonSphere * distanceFromPhotonSphere);
+    float windingBoost = mix(0.22, 2.65, smoothstep(1.0, 5.2, angularTravel));
+    return vec3(1.0, 0.60, 0.18) * criticalProximity * windingBoost;
+}
+
+vec3 acesToneMap(vec3 color) {
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    // Apply the filmic curve to peak luminance and rescale all channels
+    // together. Per-channel tone mapping turns intense orange into white;
+    // this hue-preserving form keeps relativistic highlights orange/gold.
+    float peak = max(max(color.r, color.g), max(color.b, 1e-6));
+    float mappedPeak = clamp(
+        (peak * (a * peak + b)) / (peak * (c * peak + d) + e),
+        0.0, 1.0);
+    return clamp(color * (mappedPeak / peak), 0.0, 1.0);
 }
 
 // Globals to store hit info
@@ -142,13 +374,20 @@ Ray initRay(vec3 pos, vec3 dir) {
     Ray ray;
     ray.x = pos.x; ray.y = pos.y; ray.z = pos.z;
     ray.r = length(pos);
-    ray.theta = acos(pos.z / ray.r);
-    ray.phi = atan(pos.y, pos.x);
+    // Y is the polar/up axis, so theta = PI/2 is the x-z disk plane.
+    ray.theta = acos(clamp(pos.y / ray.r, -1.0, 1.0));
+    ray.phi = atan(pos.z, pos.x);
 
     float dx = dir.x, dy = dir.y, dz = dir.z;
-    ray.dr     = sin(ray.theta)*cos(ray.phi)*dx + sin(ray.theta)*sin(ray.phi)*dy + cos(ray.theta)*dz;
-    ray.dtheta = (cos(ray.theta)*cos(ray.phi)*dx + cos(ray.theta)*sin(ray.phi)*dy - sin(ray.theta)*dz) / ray.r;
-    ray.dphi   = (-sin(ray.phi)*dx + cos(ray.phi)*dy) / (ray.r * sin(ray.theta));
+    float sinTheta = max(sin(ray.theta), 1e-6);
+    ray.dr = sinTheta * cos(ray.phi) * dx
+           + cos(ray.theta) * dy
+           + sinTheta * sin(ray.phi) * dz;
+    ray.dtheta = (cos(ray.theta) * cos(ray.phi) * dx
+                - sinTheta * dy
+                + cos(ray.theta) * sin(ray.phi) * dz) / ray.r;
+    ray.dphi = (-sin(ray.phi) * dx + cos(ray.phi) * dz)
+             / (ray.r * sinTheta);
 
     ray.L = ray.r * ray.r * sin(ray.theta) * ray.dphi;
     float f = 1.0 - SagA_rs / ray.r;
@@ -180,40 +419,76 @@ bool interceptObject(Ray ray) {
 void geodesicRHS(Ray ray, out vec3 d1, out vec3 d2) {
     float r = ray.r, theta = ray.theta;
     float dr = ray.dr, dtheta = ray.dtheta, dphi = ray.dphi;
-    float f = 1.0 - SagA_rs / r;
+    float sinTheta = max(sin(theta), 1e-6);
+    float f = max(1.0 - SagA_rs / r, 1e-6);
     float dt_dL = ray.E / f;
 
     d1 = vec3(dr, dtheta, dphi);
     d2.x = - (SagA_rs / (2.0 * r*r)) * f * dt_dL * dt_dL
          + (SagA_rs / (2.0 * r*r * f)) * dr * dr
-         + r * (dtheta*dtheta + sin(theta)*sin(theta)*dphi*dphi);
-    d2.y = -2.0*dr*dtheta/r + sin(theta)*cos(theta)*dphi*dphi;
-    d2.z = -2.0*dr*dphi/r - 2.0*cos(theta)/(sin(theta)) * dtheta * dphi;
+         + r * (dtheta*dtheta + sinTheta*sinTheta*dphi*dphi);
+    d2.y = -2.0*dr*dtheta/r + sinTheta*cos(theta)*dphi*dphi;
+    d2.z = -2.0*dr*dphi/r - 2.0*cos(theta)/sinTheta * dtheta * dphi;
 }
+
+Ray offsetRay(Ray base, vec3 positionDerivative, vec3 velocityDerivative, float scale) {
+    Ray result = base;
+    result.r      += positionDerivative.x * scale;
+    result.theta  += positionDerivative.y * scale;
+    result.phi    += positionDerivative.z * scale;
+    result.dr     += velocityDerivative.x * scale;
+    result.dtheta += velocityDerivative.y * scale;
+    result.dphi   += velocityDerivative.z * scale;
+    return result;
+}
+
 void rk4Step(inout Ray ray, float dL) {
-    vec3 k1a, k1b;
+    vec3 k1a, k1b, k2a, k2b, k3a, k3b, k4a, k4b;
     geodesicRHS(ray, k1a, k1b);
 
-    ray.r      += dL * k1a.x;
-    ray.theta  += dL * k1a.y;
-    ray.phi    += dL * k1a.z;
-    ray.dr     += dL * k1b.x;
-    ray.dtheta += dL * k1b.y;
-    ray.dphi   += dL * k1b.z;
+    Ray stage2 = offsetRay(ray, k1a, k1b, dL * 0.5);
+    geodesicRHS(stage2, k2a, k2b);
 
+    Ray stage3 = offsetRay(ray, k2a, k2b, dL * 0.5);
+    geodesicRHS(stage3, k3a, k3b);
+
+    Ray stage4 = offsetRay(ray, k3a, k3b, dL);
+    geodesicRHS(stage4, k4a, k4b);
+
+    vec3 positionDelta = (k1a + 2.0*k2a + 2.0*k3a + k4a) * (dL / 6.0);
+    vec3 velocityDelta = (k1b + 2.0*k2b + 2.0*k3b + k4b) * (dL / 6.0);
+
+    ray.r      += positionDelta.x;
+    ray.theta  += positionDelta.y;
+    ray.phi    += positionDelta.z;
+    ray.dr     += velocityDelta.x;
+    ray.dtheta += velocityDelta.y;
+    ray.dphi   += velocityDelta.z;
+
+    // Convert the Y-up spherical coordinates back to Cartesian coordinates.
     ray.x = ray.r * sin(ray.theta) * cos(ray.phi);
-    ray.y = ray.r * sin(ray.theta) * sin(ray.phi);
-    ray.z = ray.r * cos(ray.theta);
-}
-bool crossesEquatorialPlane(vec3 oldPos, vec3 newPos) {
-    bool crossed = (oldPos.y * newPos.y < 0.0);
-    float r = length(vec2(newPos.x, newPos.z));
-    return crossed && (r >= disk_r1 && r <= disk_r2);
+    ray.y = ray.r * cos(ray.theta);
+    ray.z = ray.r * sin(ray.theta) * sin(ray.phi);
 }
 
+float adaptiveStepSize(Ray ray) {
+    // Spend small, accurate steps near the horizon and quickly grow the step
+    // in weakly curved space. Camera movement uses a slightly coarser ceiling.
+    float distanceInRadii = ray.r / SagA_rs;
+    float curvatureBlend = smoothstep(1.15, 12.0, distanceInRadii);
+    float maximumStep = cam.moving != 0 ? MAX_D_LAMBDA * 1.35 : MAX_D_LAMBDA;
+    float stepSize = mix(MIN_D_LAMBDA, maximumStep, curvatureBlend);
+
+    // Prevent a single inward step from jumping across the event horizon.
+    float horizonDistance = max(ray.r - SagA_rs, MIN_D_LAMBDA);
+    float inwardSpeed = max(abs(ray.dr), 0.25);
+    float horizonSafeStep = horizonDistance * 0.20 / inwardSpeed;
+    return clamp(min(stepSize, horizonSafeStep), MIN_D_LAMBDA, maximumStep);
+}
 void main() {
-    int WIDTH  = cam.moving ? 200 : 200;
-    int HEIGHT = cam.moving ? 150 : 150;
+    ivec2 imageDimensions = imageSize(outImage);
+    int WIDTH = imageDimensions.x;
+    int HEIGHT = imageDimensions.y;
 
     ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
     if (pix.x >= WIDTH || pix.y >= HEIGHT) return;
@@ -227,40 +502,62 @@ void main() {
     vec4 color = vec4(0.0);
     vec3 prevPos = vec3(ray.x, ray.y, ray.z);
     vec3 finalRayDirection = dir;
+    vec3 diskHitPosition = vec3(0.0);
     float lambda = 0.0;
+    float closestRadius = ray.r;
+    float angularTravel = 0.0;
 
     bool hitBlackHole = false;
     bool hitDisk      = false;
     bool hitObject    = false;
+    bool escaped      = false;
 
-    int steps = cam.moving ? 60000 : 60000;
+    // Keep the same integration budget while moving. Most rays terminate
+    // early, while near-critical rays no longer change classification merely
+    // because the camera is being dragged.
+    int maxSteps = 24000;
+    float escapeRadius = max(length(cam.camPos) * 2.5, disk_r2 * 8.0);
+    float captureRadius = SagA_rs * 1.0005;
 
-    for (int i = 0; i < steps; ++i) {
-        if (intercept(ray, SagA_rs)) { hitBlackHole = true; break; }
-        rk4Step(ray, D_LAMBDA);
-        lambda += D_LAMBDA;
+    for (int i = 0; i < maxSteps; ++i) {
+        if (intercept(ray, captureRadius)) { hitBlackHole = true; break; }
+        float stepSize = adaptiveStepSize(ray);
+        rk4Step(ray, stepSize);
+        lambda += stepSize;
+
+        // Invalid near-horizon states must never fall through to the
+        // background sampler as apparent light inside the shadow.
+        if (isnan(ray.r) || isinf(ray.r)) break;
 
         vec3 newPos = vec3(ray.x, ray.y, ray.z);
+        if (any(isnan(newPos)) || any(isinf(newPos))) break;
         vec3 travel = newPos - prevPos;
         if (dot(travel, travel) > 0.0) finalRayDirection = normalize(travel);
-        if (crossesEquatorialPlane(prevPos, newPos)) { hitDisk = true; break; }
+
+        vec3 oldRadialDirection = normalize(prevPos);
+        vec3 newRadialDirection = normalize(newPos);
+        float angularIncrement = asin(clamp(
+            length(cross(oldRadialDirection, newRadialDirection)), 0.0, 1.0));
+        angularTravel += angularIncrement;
+        closestRadius = min(closestRadius, ray.r);
+
+        if (intersectAccretionDisk(prevPos, newPos, diskHitPosition)) {
+            hitDisk = true;
+            break;
+        }
+        if (intercept(ray, captureRadius)) { hitBlackHole = true; break; }
         if (interceptObject(ray)) { hitObject = true; break; }
         prevPos = newPos;
-        if (ray.r > ESCAPE_R) break;
+        if (ray.r >= escapeRadius && ray.dr > 0.0) {
+            escaped = true;
+            break;
+        }
     }
 
     if (hitDisk) {
-        float radialPosition = clamp(
-            (length(vec2(ray.x, ray.z)) - disk_r1) / (disk_r2 - disk_r1),
-            0.0, 1.0
-        );
-        float edgeFade = smoothstep(0.0, 0.08, radialPosition)
-                       * (1.0 - smoothstep(0.82, 1.0, radialPosition));
-        float turbulence = 0.72 + 0.28 * valueNoise(vec3(ray.x, ray.z, lambda) / 8.0e9);
-        vec3 innerHot = vec3(1.0, 0.92, 0.72);
-        vec3 outerHot = vec3(1.0, 0.12, 0.015);
-        vec3 diskColor = mix(innerHot, outerHot, pow(radialPosition, 0.65));
-        color = vec4(diskColor * (1.2 + 2.8 * edgeFade) * turbulence, 1.0);
+        vec3 diskColor = shadeAccretionDisk(
+            diskHitPosition, finalRayDirection, angularTravel, lambda);
+        color = vec4(diskColor, 1.0);
 
     } else if (hitBlackHole) {
         color = vec4(0.0, 0.0, 0.0, 1.0);
@@ -276,9 +573,20 @@ void main() {
         vec3 shaded = objectColor.rgb * intensity;
         color = vec4(shaded, objectColor.a);
 
-    } else {
+    } else if (escaped) {
         color = vec4(spaceBackground(finalRayDirection), 1.0);
+
+    } else {
+        // Rays that use the complete integration budget without escaping are
+        // unresolved near-critical/captured rays, not background light.
+        color = vec4(0.0, 0.0, 0.0, 1.0);
     }
+
+    if (escaped || hitDisk) {
+        color.rgb += photonRingEmission(closestRadius, angularTravel);
+    }
+
+    color.rgb = acesToneMap(color.rgb);
 
     imageStore(outImage, pix, color);
 }

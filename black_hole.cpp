@@ -37,6 +37,8 @@ double c = 299792458.0;
 double G = 6.67430e-11;
 struct Ray;
 bool Gravity = false;
+float diskInclinationRadians = radians(20.0f);
+float diskThicknessInRadii = 0.12f;
 
 struct Camera {
     // Center the camera orbit on the black hole at (0, 0, 0)
@@ -125,6 +127,21 @@ struct Camera {
             Gravity = !Gravity;
             cout << "[INFO] Gravity turned " << (Gravity ? "ON" : "OFF") << endl;
         }
+        if ((action == GLFW_PRESS || action == GLFW_REPEAT) && key == GLFW_KEY_I) {
+            float direction = (mods & GLFW_MOD_SHIFT) ? -1.0f : 1.0f;
+            diskInclinationRadians = glm::clamp(
+                diskInclinationRadians + radians(5.0f) * direction,
+                radians(0.0f), radians(85.0f));
+            cout << "[INFO] Disk inclination: "
+                 << degrees(diskInclinationRadians) << " degrees" << endl;
+        }
+        if ((action == GLFW_PRESS || action == GLFW_REPEAT) && key == GLFW_KEY_T) {
+            float scale = (mods & GLFW_MOD_SHIFT) ? (1.0f / 1.15f) : 1.15f;
+            diskThicknessInRadii = glm::clamp(
+                diskThicknessInRadii * scale, 0.02f, 0.75f);
+            cout << "[INFO] Disk half-thickness: "
+                 << diskThicknessInRadii << " Schwarzschild radii" << endl;
+        }
     }
 };
 Camera camera;
@@ -152,11 +169,43 @@ struct ObjectData {
     vec3 velocity = vec3(0.0f, 0.0f, 0.0f); // Initial velocity
 };
 vector<ObjectData> objects = {
-    { vec4(4e11f, 0.0f, 0.0f, 4e10f)   , vec4(1,1,0,1), 1.98892e30 },
-    { vec4(0.0f, 0.0f, 4e11f, 4e10f)   , vec4(1,0,0,1), 1.98892e30 },
-    { vec4(0.0f, 0.0f, 0.0f, SagA.r_s) , vec4(0,0,0,1), static_cast<float>(SagA.mass)  },
-    //{ vec4(6e10f, 0.0f, 0.0f, 5e10f), vec4(0,1,0,1) }
+    { vec4(0.0f, 0.0f, 0.0f, SagA.r_s),
+      vec4(0.0f, 0.0f, 0.0f, 1.0f),
+      static_cast<float>(SagA.mass) }
 };
+
+void integrateGravity(vector<ObjectData>& bodies, double timeStep) {
+    vector<dvec3> accelerations(bodies.size(), dvec3(0.0));
+    constexpr double softeningLength = 1.0e7;
+    const double softeningSquared = softeningLength * softeningLength;
+
+    // Evaluate each pair once from a single snapshot of the system.
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        for (size_t j = i + 1; j < bodies.size(); ++j) {
+            dvec3 delta = dvec3(bodies[j].posRadius) - dvec3(bodies[i].posRadius);
+            double distanceSquared = dot(delta, delta) + softeningSquared;
+            double inverseDistanceCubed = 1.0 /
+                (distanceSquared * sqrt(distanceSquared));
+
+            accelerations[i] += G * static_cast<double>(bodies[j].mass)
+                              * delta * inverseDistanceCubed;
+            accelerations[j] -= G * static_cast<double>(bodies[i].mass)
+                              * delta * inverseDistanceCubed;
+        }
+    }
+
+    // main() supplies a fixed step, making gravity independent of render FPS.
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        dvec3 velocity = dvec3(bodies[i].velocity)
+                       + accelerations[i] * timeStep;
+        dvec3 position = dvec3(bodies[i].posRadius)
+                       + velocity * timeStep;
+        bodies[i].velocity = vec3(velocity);
+        bodies[i].posRadius.x = static_cast<float>(position.x);
+        bodies[i].posRadius.y = static_cast<float>(position.y);
+        bodies[i].posRadius.z = static_cast<float>(position.z);
+    }
+}
 
 struct Engine {
     GLuint gridShaderProgram;
@@ -178,8 +227,8 @@ struct Engine {
 
     int WIDTH = 800;  // Window width
     int HEIGHT = 600; // Window height
-    int COMPUTE_WIDTH  = 200;   // Compute resolution width
-    int COMPUTE_HEIGHT = 150;  // Compute resolution height
+    int COMPUTE_WIDTH  = 320;   // Stationary render resolution width
+    int COMPUTE_HEIGHT = 240;   // Stationary render resolution height
     float width = 100000000000.0f; // Width of the viewport in meters
     float height = 75000000000.0f; // Height of the viewport in meters
     
@@ -221,7 +270,7 @@ struct Engine {
 
         glGenBuffers(1, &diskUBO);
         glBindBuffer(GL_UNIFORM_BUFFER, diskUBO);
-        glBufferData(GL_UNIFORM_BUFFER, sizeof(float) * 4, nullptr, GL_DYNAMIC_DRAW); // 3 values + 1 padding
+        glBufferData(GL_UNIFORM_BUFFER, sizeof(float) * 8, nullptr, GL_DYNAMIC_DRAW);
         glBindBufferBase(GL_UNIFORM_BUFFER, 2, diskUBO); // binding = 2 matches compute shader
 
         glGenBuffers(1, &objectsUBO);
@@ -229,8 +278,7 @@ struct Engine {
         // allocate space for 16 objects: 
         // sizeof(int) + padding + 16×(vec4 posRadius + vec4 color)
         GLsizeiptr objUBOSize = sizeof(int) + 3 * sizeof(float)
-            + 16 * (sizeof(vec4) + sizeof(vec4))
-            + 16 * sizeof(float); // 16 floats for mass
+            + 16 * (sizeof(vec4) + sizeof(vec4) + sizeof(vec4));
         glBufferData(GL_UNIFORM_BUFFER, objUBOSize, nullptr, GL_DYNAMIC_DRAW);
         glBindBufferBase(GL_UNIFORM_BUFFER, 3, objectsUBO);  // binding = 3 matches shader
 
@@ -475,8 +523,8 @@ struct Engine {
     }
     void dispatchCompute(const Camera& cam) {
         // determine target compute‐res
-        int cw = cam.moving ? COMPUTE_WIDTH  : 200;
-        int ch = cam.moving ? COMPUTE_HEIGHT : 150;
+        int cw = cam.moving ? 200 : COMPUTE_WIDTH;
+        int ch = cam.moving ? 150 : COMPUTE_HEIGHT;
 
         // 1) reallocate the texture if needed
         glBindTexture(GL_TEXTURE_2D, texture);
@@ -514,9 +562,9 @@ struct Engine {
             vec3 forward; float _pad3;
             float tanHalfFov;
             float aspect;
-            bool moving;
+            int moving;
             int _pad4;
-        } data;
+        } data{};
         vec3 fwd = normalize(cam.target - cam.position());
         vec3 up = vec3(0, 1, 0); // y axis is up, so disk is in x-z plane
         vec3 right = normalize(cross(fwd, up));
@@ -528,7 +576,7 @@ struct Engine {
         data.forward = fwd;
         data.tanHalfFov = tan(radians(60.0f * 0.5f));
         data.aspect = float(WIDTH) / float(HEIGHT);
-        data.moving = cam.dragging || cam.panning;
+        data.moving = (cam.dragging || cam.panning) ? 1 : 0;
 
         glBindBuffer(GL_UNIFORM_BUFFER, cameraUBO);
         glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(UBOData), &data);
@@ -539,8 +587,8 @@ struct Engine {
             float _pad0, _pad1, _pad2;        // <-- pad out to 16 bytes
             vec4  posRadius[16];
             vec4  color[16];
-            float  mass[16]; 
-        } data;
+            vec4  mass[16];
+        } data{};
 
         size_t count = std::min(objs.size(), size_t(16));
         data.numObjects = static_cast<int>(count);
@@ -548,7 +596,8 @@ struct Engine {
         for (size_t i = 0; i < count; ++i) {
             data.posRadius[i] = objs[i].posRadius;
             data.color[i] = objs[i].color;
-            data.mass[i] = objs[i].mass;
+            // std140 scalar arrays use a 16-byte stride.
+            data.mass[i] = vec4(objs[i].mass, 0.0f, 0.0f, 0.0f);
         }
 
         // Upload
@@ -559,9 +608,17 @@ struct Engine {
         // disk
         float r1 = SagA.r_s * 2.2f;    // inner radius just outside the event horizon
         float r2 = SagA.r_s * 5.2f;   // outer radius of the disk
-        float num = 2.0;               // number of rays
-        float thickness = 1e9f;          // padding for std140 alignment
-        float diskData[4] = { r1, r2, num, thickness };
+        float thickness = SagA.r_s * diskThicknessInRadii;
+        float diskData[8] = {
+            r1,
+            r2,
+            diskInclinationRadians,
+            thickness,
+            static_cast<float>(fmod(glfwGetTime(), 10000.0)),
+            1.0f,  // normalized accretion rate / emissivity
+            1.0f,  // procedural detail strength
+            0.0f
+        };
 
         glBindBuffer(GL_UNIFORM_BUFFER, diskUBO);
         glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(diskData), diskData);
@@ -657,6 +714,8 @@ int main() {
     lastPrintTime = chrono::duration<double>(t0.time_since_epoch()).count();
 
     double lastTime = glfwGetTime();
+    double gravityAccumulator = 0.0;
+    constexpr double gravityTimeStep = 1.0 / 120.0;
     int   renderW  = 800, renderH = 600, numSteps = 80000;
     while (!glfwWindowShouldClose(engine.window)) {
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);  // optional, but good practice
@@ -666,33 +725,16 @@ int main() {
         double dt    = now - lastTime;   // seconds since last frame
         lastTime     = now;
 
-        // Gravity
-        for (auto& obj : objects) {
-            for (auto& obj2 : objects) {
-                if (&obj == &obj2) continue; // skip self-interaction
-                 float dx  = obj2.posRadius.x - obj.posRadius.x;
-                 float dy = obj2.posRadius.y - obj.posRadius.y;
-                 float dz = obj2.posRadius.z - obj.posRadius.z;
-                 float distance = sqrt(dx * dx + dy * dy + dz * dz);
-                 if (distance > 0) {
-                        vector<double> direction = {dx / distance, dy / distance, dz / distance};
-                        //distance *= 1000;
-                        double Gforce = (G * obj.mass * obj2.mass) / (distance * distance);
-
-                        double acc1 = Gforce / obj.mass;
-                        std::vector<double> acc = {direction[0] * acc1, direction[1] * acc1, direction[2] * acc1};
-                        if (Gravity) {
-                            obj.velocity.x += acc[0];
-                            obj.velocity.y += acc[1];
-                            obj.velocity.z += acc[2];
-
-                            obj.posRadius.x += obj.velocity.x;
-                            obj.posRadius.y += obj.velocity.y;
-                            obj.posRadius.z += obj.velocity.z;
-                            cout << "velocity: " <<obj.velocity.x<<", " <<obj.velocity.y<<", " <<obj.velocity.z<<endl;
-                        }
-                    }
+        // Decouple physics from rendering. Fixed substeps produce the same
+        // evolution at different frame rates and avoid large unstable jumps.
+        if (Gravity) {
+            gravityAccumulator += std::min(dt, 0.25);
+            while (gravityAccumulator >= gravityTimeStep) {
+                integrateGravity(objects, gravityTimeStep);
+                gravityAccumulator -= gravityTimeStep;
             }
+        } else {
+            gravityAccumulator = 0.0;
         }
 
 
